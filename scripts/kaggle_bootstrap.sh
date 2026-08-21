@@ -76,6 +76,14 @@ PY
 python -c "import pagedserve; print('pagedserve', pagedserve.__version__)"
 pytest -q -m "not gpu"
 
+echo "==> GPU smoke checks (the CUDA paths that have never run)"
+python scripts/gpu_smoke.py || echo "SOME GPU CHECKS FAILED - see above, this is the useful output"
+
+echo "==> golden test on GPU, in this device's native dtype"
+PAGEDSERVE_TEST_DEVICE=cuda \
+PAGEDSERVE_TEST_DTYPE=$(python -c "import torch;print('bfloat16' if torch.cuda.is_bf16_supported() else 'float16')") \
+    pytest tests/test_golden.py -q || echo "GOLDEN TEST FAILED ON GPU - this is a bug report"
+
 echo "==> smoke run (mock backend, proves the harness works here)"
 python bench/loadgen.py --backend mock --mode closed --concurrency 8 \
     --num-requests 32 --max-tokens 16

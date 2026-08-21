@@ -109,7 +109,10 @@ def profile_num_blocks(
         torch.cuda.synchronize()
 
     peak_activation = max(0, torch.cuda.max_memory_allocated() - weights_bytes)
-    total = torch.cuda.get_device_properties(device).total_memory
+    # device may be torch.device("cuda") with no index; resolve it explicitly
+    # rather than relying on every torch version to accept that.
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    total = torch.cuda.get_device_properties(index).total_memory
     block_bytes = bytes_per_block(model, cache.block_size, dtype)
 
     num_blocks = blocks_from_budget(

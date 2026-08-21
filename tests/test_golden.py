@@ -33,6 +33,10 @@ from pagedserve.engine import LLMEngine  # noqa: E402
 # Small, ungated, and already cached on the dev machine, so this test needs no
 # token and no network. Override to run the gate against another checkpoint.
 GOLDEN_MODEL = os.environ.get("PAGEDSERVE_GOLDEN_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+# The gate must pass on every device and dtype we run on, not just the laptop's.
+# On a T4 that means float16, since Turing has no bfloat16 at all.
+TEST_DEVICE = os.environ.get("PAGEDSERVE_TEST_DEVICE", "cpu")
+TEST_DTYPE = os.environ.get("PAGEDSERVE_TEST_DTYPE", "float32")
 
 # Fixed by design. A golden test whose prompts change is not a golden test.
 GOLDEN_PROMPTS = [
@@ -88,10 +92,16 @@ def reference(model_path, tokenizer):
     """HuggingFace greedy output, with the checkpoint's sampling knobs removed."""
     from transformers import AutoModelForCausalLM, GenerationConfig
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.float32).eval()
+    from bench.baseline_hf import dtype_kwarg
+
+    model = (
+        AutoModelForCausalLM.from_pretrained(model_path, **dtype_kwarg(getattr(torch, TEST_DTYPE)))
+        .to(TEST_DEVICE)
+        .eval()
+    )
 
     def generate(prompts: list[str], max_new_tokens: int) -> list[list[int]]:
-        encoded = tokenizer(prompts, return_tensors="pt", padding=True)
+        encoded = tokenizer(prompts, return_tensors="pt", padding=True).to(TEST_DEVICE)
         config = GenerationConfig(
             max_new_tokens=max_new_tokens,
             do_sample=False,
@@ -134,8 +144,8 @@ def build_engine(model_path: str, backend: str) -> LLMEngine:
     """
     return LLMEngine.from_pretrained(
         model_path,
-        device="cpu",
-        dtype="float32",
+        device=TEST_DEVICE,
+        dtype=TEST_DTYPE,
         cache=CacheConfig(max_seq_len=256, max_num_seqs=8, block_size=16, num_blocks_override=128),
         attn_backend=backend,
         debug_invariants=True,
@@ -418,8 +428,8 @@ class TestContinuousBatching:
         prompt_ids, expected = self.reference(paged_engine, tokenizer)
         starved = LLMEngine.from_pretrained(
             model_path,
-            device="cpu",
-            dtype="float32",
+            device=TEST_DEVICE,
+            dtype=TEST_DTYPE,
             cache=CacheConfig(
                 max_seq_len=256,
                 max_num_seqs=8,

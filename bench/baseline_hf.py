@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "BaselineConfig",
+    "dtype_kwarg",
     "HFBaselineBackend",
     "count_output_tokens",
     "load_model_and_tokenizer",
@@ -101,6 +102,21 @@ class BaselineConfig:
         }
 
 
+def dtype_kwarg(dtype: torch.dtype) -> dict[str, Any]:
+    """The dtype keyword this installed transformers actually understands.
+
+    transformers renamed ``torch_dtype`` to ``dtype`` in v5. Passing the wrong
+    one does not raise on older versions -- it is swallowed by ``**kwargs`` and
+    the model quietly loads in float32 while every log line claims float16.
+    That would make a baseline twice as slow as it should be and the comparison
+    against it meaningless.
+    """
+    import transformers
+
+    major = int(transformers.__version__.split(".")[0])
+    return {"dtype": dtype} if major >= 5 else {"torch_dtype": dtype}
+
+
 def load_model_and_tokenizer(config: BaselineConfig) -> tuple[Any, Any]:
     """Load the reference model and a left-padding tokenizer.
 
@@ -119,7 +135,9 @@ def load_model_and_tokenizer(config: BaselineConfig) -> tuple[Any, Any]:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        config.model, dtype=dtype, trust_remote_code=config.trust_remote_code
+        config.model,
+        trust_remote_code=config.trust_remote_code,
+        **dtype_kwarg(dtype),
     )
     model.to(device)
     model.eval()
