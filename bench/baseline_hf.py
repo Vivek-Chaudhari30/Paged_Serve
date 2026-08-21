@@ -56,7 +56,7 @@ from transformers import (
 # (AGENTS.md section 4.1): the baseline and the engine must agree on what
 # hardware they are running on, or the comparison between them is not
 # controlled. Re-exported here so callers of this module need not care.
-from bench.loadgen import PromptRequest
+from bench.loadgen import PromptRequest, tokenize_prompts
 from pagedserve.config import resolve_device, resolve_dtype
 
 logger = logging.getLogger(__name__)
@@ -125,25 +125,6 @@ def load_model_and_tokenizer(config: BaselineConfig) -> tuple[Any, Any]:
     model.eval()
     logger.info("loaded %s on %s with %s", config.model, device, dtype)
     return model, tokenizer
-
-
-def tokenize_prompts(prompts: Sequence[PromptRequest], tokenizer: Any) -> list[PromptRequest]:
-    """Fill in ``prompt_tokens`` now that a real tokenizer is available.
-
-    The dataset loader leaves the count unknown rather than estimating it; this
-    is where it becomes known, which is what makes prompt throughput reportable
-    for a baseline run.
-    """
-    counts = [len(tokenizer(p.prompt).input_ids) for p in prompts]
-    return [
-        PromptRequest(
-            prompt=p.prompt,
-            max_tokens=p.max_tokens,
-            prompt_tokens=n,
-            request_id=p.request_id,
-        )
-        for p, n in zip(prompts, counts, strict=True)
-    ]
 
 
 def count_output_tokens(

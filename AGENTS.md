@@ -295,6 +295,22 @@ Phase 3 deliverables:
       output identical to an unpreempted run
 - [ ] Full concurrency sweep committed to `results/` — **needs a GPU.**
 
+The engine is now benchmarkable through the Phase 0 harness. Three ablation
+arms, one command each — the moment a GPU is available these produce committable
+result JSON:
+
+| Arm | Flag | Isolates |
+|---|---|---|
+| contiguous + static | `--no-paging` | the naive floor |
+| paged + static | `--static-batching` | paging alone |
+| paged + continuous | (default) | iteration-level scheduling |
+
+```bash
+python bench/loadgen.py --backend pagedserve --model Qwen/Qwen2.5-0.5B-Instruct \
+    --mode closed --concurrency 32 --num-requests 256 --max-tokens 128 \
+    --output results/<run>.json
+```
+
 Continuous batching output is token-identical to static batching, and stays
 identical under forced preemption with either policy.
 

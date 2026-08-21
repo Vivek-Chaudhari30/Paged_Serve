@@ -23,6 +23,7 @@ Phase 3 replaces ``generate()`` with an iteration-level ``step()``. The name
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -201,6 +202,7 @@ class LLMEngine:
         max_tokens: int,
         *,
         eos_token_ids: tuple[int, ...] | None = None,
+        on_step: Callable[[list[int | None]], None] | None = None,
     ) -> GenerationOutput:
         """Generate greedily for a whole batch at once, left-padded.
 
@@ -208,6 +210,11 @@ class LLMEngine:
             prompt_token_ids: One list of token ids per request.
             max_tokens: Cap on generated tokens per request.
             eos_token_ids: Stop tokens. Defaults to the checkpoint's.
+            on_step: Called after each decode step with one entry per sequence:
+                the token just produced, or ``None`` for a sequence that has
+                already finished. Exists so a benchmark can observe tokens as
+                they appear — returning everything at the end would report a
+                TTFT equal to E2E for every request and erase the metric.
 
         Returns:
             Generated ids per request, why each stopped, and the per-step KV
@@ -283,6 +290,7 @@ class LLMEngine:
         for offset in range(max_tokens):
             position = max_prompt + offset
             token_list = next_tokens.tolist()
+            before_finished = list(finished)
             for i, token in enumerate(token_list):
                 if finished[i]:
                     continue
@@ -292,6 +300,14 @@ class LLMEngine:
                     finish_reasons[i] = "stop"
                 elif len(outputs[i]) >= max_tokens:
                     finished[i] = True
+
+            if on_step is not None:
+                on_step(
+                    [
+                        None if was_finished else token_list[i]
+                        for i, was_finished in enumerate(before_finished)
+                    ]
+                )
 
             if all(finished):
                 break
