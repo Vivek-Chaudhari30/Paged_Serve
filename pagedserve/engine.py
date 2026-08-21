@@ -663,6 +663,38 @@ class LLMEngine:
             ),
         )
 
+    @torch.inference_mode()
+    def logits_for(self, token_ids: list[int]) -> torch.Tensor:
+        """Logits for the next token after ``token_ids``, one prefill pass.
+
+        A diagnostic hook, not part of generation. Comparing raw logits between
+        two backends at a contested step is what separates "these implementations
+        disagree" from "these implementations agree and float16 rounded the
+        argmax differently".
+        """
+        device = self.config.device
+        length = len(token_ids)
+        self.backend.allocate()
+        if self.block_manager is not None:
+            self.block_manager.reset()
+            self.block_manager.allocate(0, length)
+
+        input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+        position_ids = torch.arange(length, device=device).unsqueeze(0)
+        padding_mask = torch.ones((1, length), dtype=torch.bool, device=device)
+        step = self._build_step(
+            query_len=length,
+            context_len=0,
+            seq_lens=torch.tensor([length], dtype=torch.int32, device=device),
+            padding_mask=padding_mask,
+            query_positions=position_ids,
+            is_prefill=True,
+            token_is_real=padding_mask,
+            logical_starts=[0],
+        )
+        metadata = self.backend.begin_step(step)
+        return self.model(input_ids, position_ids, self.backend, metadata)[0]
+
     def config_dict(self) -> dict[str, Any]:
         """The engine config, for a benchmark result file's ``config`` block."""
         return self.config.to_dict()

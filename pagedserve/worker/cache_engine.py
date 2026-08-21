@@ -88,6 +88,13 @@ def profile_num_blocks(
     meaningful free-memory figure for host RAM, and inventing one would put a
     fabricated number at the root of every capacity decision. So a non-CUDA
     device requires ``CacheConfig.num_blocks_override``, and says so.
+
+    **Known gap.** No caller supplies ``run_max_shape_forward`` yet, because
+    running a forward pass requires a KV cache and sizing the KV cache is what
+    this function is for. Until that is resolved with a two-pass profile,
+    activation memory is measured as zero and the block count is optimistic —
+    on a 15 GiB card it hands roughly 13 GiB to KV. The warning below says so
+    at runtime rather than leaving it to be discovered as an OOM.
     """
     if cache.num_blocks_override is not None:
         logger.info("using num_blocks override: %d", cache.num_blocks_override)
@@ -107,6 +114,17 @@ def profile_num_blocks(
     if run_max_shape_forward is not None:
         run_max_shape_forward()
         torch.cuda.synchronize()
+    else:
+        # Loud, because the resulting number is optimistic in a way that only
+        # shows up as an OOM under load. Activation memory is real -- attention
+        # workspace, the logits tensor over a 150k vocabulary, whatever cuBLAS
+        # decides it wants -- and counting it as zero hands the KV cache memory
+        # that something else is going to ask for later.
+        logger.warning(
+            "sizing the KV cache without a profiling forward pass: activation "
+            "memory is being counted as zero, so this estimate is optimistic. "
+            "Set CacheConfig.num_blocks_override for a run that must not OOM."
+        )
 
     peak_activation = max(0, torch.cuda.max_memory_allocated() - weights_bytes)
     # device may be torch.device("cuda") with no index; resolve it explicitly
