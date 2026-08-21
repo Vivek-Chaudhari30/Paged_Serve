@@ -31,10 +31,13 @@ import torch
 
 from pagedserve.attention.backend import AttentionBackend, KVMemoryStats, StepInput
 from pagedserve.attention.contiguous import ContiguousAttentionBackend
+from pagedserve.attention.gather import PagedAttentionBackend
 from pagedserve.config import CacheConfig, EngineConfig, ModelConfig
+from pagedserve.memory.block_manager import AllocStatus, BlockManager
 from pagedserve.model.llama import CausalLM
 from pagedserve.model.loader import load_state_dict, resolve_model_path
 from pagedserve.model.sampler import greedy
+from pagedserve.worker.cache_engine import profile_num_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -75,19 +78,69 @@ class GenerationOutput:
         )
 
 
-def _build_backend(config: EngineConfig) -> AttentionBackend:
+BACKENDS = ("contiguous", "gather")
+
+
+def _build_backend(
+    config: EngineConfig, *, weights_bytes: int = 0
+) -> tuple[AttentionBackend, BlockManager | None]:
+    """Construct the configured backend and, if it pages, its allocator.
+
+    The engine owns the BlockManager rather than the backend, because Phase 3's
+    scheduler needs it to make admission and preemption decisions and those are
+    not the storage layer's business.
+    """
     if config.attn_backend == "contiguous":
-        return ContiguousAttentionBackend(config.model, device=config.device, dtype=config.dtype)
-    raise ValueError(f"unknown attention backend {config.attn_backend!r} (available: contiguous)")
+        # --no-paging. The Phase 1 arm, kept working forever so that the paged
+        # comparison is a controlled experiment with exactly one variable.
+        return (
+            ContiguousAttentionBackend(
+                config.model, config.cache, device=config.device, dtype=config.dtype
+            ),
+            None,
+        )
+    if config.attn_backend == "gather":
+        num_blocks = profile_num_blocks(
+            config.model,
+            config.cache,
+            device=config.device,
+            dtype=config.dtype,
+            weights_bytes=weights_bytes,
+        )
+        manager = BlockManager(num_blocks, config.cache.block_size)
+        backend = PagedAttentionBackend(
+            config.model,
+            config.cache,
+            num_blocks=num_blocks,
+            device=config.device,
+            dtype=config.dtype,
+        )
+        # Both derive the trash block id from num_blocks. Assert rather than
+        # trust: a mismatch would scribble padding K/V into a real sequence's
+        # last block, and the symptom would be wrong tokens, not a crash.
+        assert backend.trash_block_id == manager.trash_block_id
+        return backend, manager
+    raise ValueError(f"unknown attention backend {config.attn_backend!r} (available: {BACKENDS})")
 
 
 class LLMEngine:
     """Owns the model, the KV cache, and the generation loop."""
 
-    def __init__(self, config: EngineConfig, model: CausalLM, backend: AttentionBackend):
+    def __init__(
+        self,
+        config: EngineConfig,
+        model: CausalLM,
+        backend: AttentionBackend,
+        block_manager: BlockManager | None = None,
+    ):
         self.config = config
         self.model = model
         self.backend = backend
+        self.block_manager = block_manager
+
+    @property
+    def is_paged(self) -> bool:
+        return self.block_manager is not None
 
     @classmethod
     def from_pretrained(
@@ -97,9 +150,14 @@ class LLMEngine:
         device: str | None = None,
         dtype: str | None = None,
         cache: CacheConfig | None = None,
-        attn_backend: str = "contiguous",
+        attn_backend: str = "gather",
+        debug_invariants: bool = False,
     ) -> LLMEngine:
-        """Load a checkpoint and build an engine around it."""
+        """Load a checkpoint and build an engine around it.
+
+        Defaults to the paged backend. ``attn_backend="contiguous"`` selects the
+        ``--no-paging`` ablation arm.
+        """
         path = resolve_model_path(model)
         model_config = ModelConfig.from_pretrained(path, name=str(model))
         config = EngineConfig.build(
@@ -108,14 +166,16 @@ class LLMEngine:
             dtype=dtype,
             cache=cache,
             attn_backend=attn_backend,
+            debug_invariants=debug_invariants,
         )
 
         module = CausalLM(model_config, config.dtype, config.device)
         module.load_weights(load_state_dict(path, dtype=config.dtype, device=config.device))
         module.eval()
 
-        backend = _build_backend(config)
-        return cls(config, module, backend)
+        weights_bytes = sum(p.numel() * p.element_size() for p in module.parameters())
+        backend, manager = _build_backend(config, weights_bytes=weights_bytes)
+        return cls(config, module, backend, manager)
 
     @torch.inference_mode()
     def generate(
@@ -158,10 +218,21 @@ class LLMEngine:
                 f"({self.config.cache.max_num_seqs})"
             )
 
-        # The naive reservation: every slot gets room for max_seq_len tokens
-        # regardless of what it will use. Sizing this to the batch's actual need
-        # would understate exactly the waste this arm exists to measure.
-        self.backend.allocate(num_seq_slots=batch, max_seq_len=cache_len)
+        self.backend.allocate()
+        if self.block_manager is not None:
+            self.block_manager.reset()
+            for seq_id, length in enumerate(prompt_lens):
+                status = self.block_manager.can_allocate(length + max_tokens)
+                if status is AllocStatus.NEVER:
+                    raise ValueError(
+                        f"sequence {seq_id} needs more blocks than the cache holds "
+                        f"({length + max_tokens} tokens); raise num_blocks or lower "
+                        f"max_tokens"
+                    )
+                # Phase 2 still batches statically, so every sequence is
+                # admitted up front. Phase 3 is where LATER stops meaning
+                # "fail" and starts meaning "wait in the queue".
+                self.block_manager.allocate(seq_id, length)
 
         input_ids, padding_mask, position_ids = self._left_pad(prompt_token_ids, cache_len)
 
@@ -174,12 +245,15 @@ class LLMEngine:
         step_stats: list[KVMemoryStats] = []
 
         # ---- prefill: the whole padded prompt in one pass ----
-        step = StepInput(
+        step = self._build_step(
             query_len=max_prompt,
             context_len=0,
             seq_lens=seq_lens,
             padding_mask=padding_mask[:, :max_prompt],
+            query_positions=position_ids[:, :max_prompt],
             is_prefill=True,
+            token_is_real=padding_mask[:, :max_prompt],
+            logical_starts=[0] * batch,
         )
         metadata = self.backend.begin_step(step)
         logits = self.model(
@@ -219,12 +293,22 @@ class LLMEngine:
             # next position is its own length, not the shared step index.
             position_ids[:, position] = seq_lens - 1
 
-            step = StepInput(
+            if self.block_manager is not None:
+                # One allocator call per sequence per step, and it only touches
+                # the free list when a block boundary is crossed -- once every
+                # block_size tokens.
+                for seq_id in range(batch):
+                    self.block_manager.append_slot(seq_id, int(seq_lens[seq_id]))
+
+            step = self._build_step(
                 query_len=1,
                 context_len=position,
                 seq_lens=seq_lens,
                 padding_mask=padding_mask[:, : position + 1],
+                query_positions=position_ids[:, position : position + 1],
                 is_prefill=False,
+                token_is_real=torch.ones((batch, 1), dtype=torch.bool, device=device),
+                logical_starts=[int(seq_lens[i]) - 1 for i in range(batch)],
             )
             metadata = self.backend.begin_step(step)
             logits = self.model(
@@ -241,6 +325,89 @@ class LLMEngine:
         )
         logger.info("%s", result.utilization_report())
         return result
+
+    def _build_step(
+        self,
+        *,
+        query_len: int,
+        context_len: int,
+        seq_lens: torch.Tensor,
+        padding_mask: torch.Tensor,
+        query_positions: torch.Tensor,
+        is_prefill: bool,
+        token_is_real: torch.Tensor,
+        logical_starts: list[int],
+    ) -> StepInput:
+        """Describe this step for whichever backend is installed.
+
+        The dense backend needs nothing beyond lengths and a mask. The paged one
+        additionally needs to know where every token in the batch should be
+        written (``slot_mapping``) and which physical blocks each sequence owns
+        (``block_tables``). Building those here rather than inside the backend
+        keeps the allocator's knowledge in one place.
+
+        Args:
+            token_is_real: ``[num_seqs, query_len]``, False for left padding.
+                Padding still flows through the model and produces K and V, so
+                it needs a destination that is not a real sequence's cache.
+            logical_starts: Logical position within each sequence at which this
+                step's first *real* token lands.
+        """
+        if self.block_manager is None:
+            return StepInput(
+                query_len=query_len,
+                context_len=context_len,
+                seq_lens=seq_lens,
+                padding_mask=padding_mask,
+                query_positions=query_positions,
+                is_prefill=is_prefill,
+            )
+
+        manager = self.block_manager
+        device = self.config.device
+        num_seqs = int(token_is_real.shape[0])
+        real = token_is_real.tolist()
+
+        trash = manager.trash_block_id * manager.block_size
+        slots: list[int] = []
+        for seq_id in range(num_seqs):
+            logical = logical_starts[seq_id]
+            table = manager.block_table(seq_id)
+            for j in range(query_len):
+                if not real[seq_id][j]:
+                    # Padding goes to the trash block, keeping the write path a
+                    # single fused scatter instead of a per-sequence branch.
+                    slots.append(trash)
+                    continue
+                slots.append(table.slot(logical))
+                logical += 1
+
+        max_blocks = max(len(manager.block_table(i)) for i in range(num_seqs))
+        tables = []
+        for seq_id in range(num_seqs):
+            blocks = list(manager.block_table(seq_id))
+            # Short tables are padded with the trash block. Those positions are
+            # masked out by seq_lens, so what they point at is never read -- but
+            # it must not be another sequence's live block.
+            blocks += [manager.trash_block_id] * (max_blocks - len(blocks))
+            tables.append(blocks)
+
+        manager_used = manager.num_used_blocks
+        if hasattr(self.backend, "set_used_blocks"):
+            self.backend.set_used_blocks(manager_used)
+        if self.config.debug_invariants:
+            manager.check_invariants({i: int(seq_lens[i]) for i in range(num_seqs)})
+
+        return StepInput(
+            query_len=query_len,
+            context_len=context_len,
+            seq_lens=seq_lens,
+            padding_mask=padding_mask,
+            query_positions=query_positions,
+            is_prefill=is_prefill,
+            block_tables=torch.tensor(tables, dtype=torch.long, device=device),
+            slot_mapping=torch.tensor(slots, dtype=torch.long, device=device),
+        )
 
     def _left_pad(
         self, prompt_token_ids: list[list[int]], cache_len: int

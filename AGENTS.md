@@ -280,7 +280,35 @@ pytest                                 # on a GPU machine
 
 ## 7. Current status
 
-**Current phase: 1 — naive engine with a contiguous KV cache.**
+**Current phase: 2 — paged KV cache (Python gather path).**
+
+Phase 2 deliverables:
+- [x] `memory/block.py`, `memory/block_manager.py` — free list, block tables,
+      refcounts, `can_allocate`/`allocate`/`append_slot`/`free`/`fork`
+- [x] `worker/cache_engine.py` — capacity profiling, one preallocation
+- [x] Write path: flat `slot_mapping`, one fused `index_copy_`, no per-sequence loop
+- [x] `attention/gather.py` — the correctness oracle, kept forever
+- [x] Paging off via `attn_backend="contiguous"` (the `--no-paging` path).
+      **Not yet a CLI flag** — there is no engine CLI until Phase 6; Phase 8
+      makes it first-class.
+- [x] `tests/test_block_manager.py` with the §5 invariants
+- [ ] Throughput comparison vs Phase 1 — needs a GPU; a CPU timing is not evidence.
+
+Measured KV utilization, 4 prompts, `block_size=16` (CPU/fp32, so pure
+allocated-versus-live bookkeeping — device-independent):
+
+| generated tokens | contiguous | paged |
+|---|---|---|
+| 16 | 2.1% | 68.0% |
+| 48 | 5.1% | 80.9% |
+| 96 | 8.6% | 87.8% |
+| 256 | — | 94.4% |
+
+Paged utilization rises with length because waste is bounded by
+`block_size - 1` in the last block only, instead of by `max_seq_len`. Output is
+bit-identical between the two backends.
+
+**Previous phase: 1 — naive engine with a contiguous KV cache.**
 
 Phase 1 deliverables:
 - [x] `model/loader.py` — safetensors into a state dict

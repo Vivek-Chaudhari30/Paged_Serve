@@ -123,14 +123,43 @@ def _eos_ids(tokenizer) -> set[int]:
     return set(eos) if isinstance(eos, list) else {eos}
 
 
-@pytest.fixture(scope="module")
-def engine(model_path):
+def build_engine(model_path: str, backend: str) -> LLMEngine:
+    """An engine on the named backend, with allocator invariants checked.
+
+    ``num_blocks_override`` is required off CUDA: there is no way to measure
+    free host memory, and inventing a figure would put a fabricated number under
+    every capacity decision. 128 blocks x 16 tokens = 2048 slots, which is
+    exactly ``max_num_seqs x max_seq_len``, so the paged arm is given the same
+    capacity the dense arm reserves.
+    """
     return LLMEngine.from_pretrained(
         model_path,
         device="cpu",
         dtype="float32",
-        cache=CacheConfig(max_seq_len=256, max_num_seqs=8),
+        cache=CacheConfig(max_seq_len=256, max_num_seqs=8, block_size=16, num_blocks_override=128),
+        attn_backend=backend,
+        debug_invariants=True,
     )
+
+
+@pytest.fixture(scope="module", params=["contiguous", "gather"])
+def engine(request, model_path):
+    """Every golden assertion runs against every backend.
+
+    AGENTS.md §2.2 requires it, and it is what makes a new backend's first
+    failure a test failure rather than a subtly wrong benchmark six weeks later.
+    """
+    return build_engine(model_path, request.param)
+
+
+@pytest.fixture(scope="module")
+def dense_engine(model_path):
+    return build_engine(model_path, "contiguous")
+
+
+@pytest.fixture(scope="module")
+def paged_engine(model_path):
+    return build_engine(model_path, "gather")
 
 
 class TestGoldenOutput:
@@ -208,15 +237,82 @@ class TestGenerationMechanics:
             engine.generate([ids] * 9, max_tokens=4)
 
 
+class TestPagedEquivalence:
+    """Paging must be invisible to the tokens produced.
+
+    A memory layout change that alters output is a bug, not an optimisation.
+    This is the Phase 2 assertion: same tokens, far less memory.
+    """
+
+    def test_paged_and_dense_agree_bit_for_bit(self, dense_engine, paged_engine, tokenizer):
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        dense = dense_engine.generate(prompt_ids, max_tokens=MAX_NEW_TOKENS)
+        paged = paged_engine.generate(prompt_ids, max_tokens=MAX_NEW_TOKENS)
+        assert dense.token_ids == paged.token_ids
+        assert dense.finish_reasons == paged.finish_reasons
+
+    def test_paged_uses_far_less_memory_for_the_same_work(
+        self, dense_engine, paged_engine, tokenizer
+    ):
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        dense = dense_engine.generate(prompt_ids, max_tokens=MAX_NEW_TOKENS)
+        paged = paged_engine.generate(prompt_ids, max_tokens=MAX_NEW_TOKENS)
+        # Identical live bytes -- the same real tokens are cached either way.
+        assert dense.final_stats.live_bytes == paged.final_stats.live_bytes
+        # But the paged arm holds only the blocks it needs.
+        assert paged.final_stats.allocated_bytes < dense.final_stats.allocated_bytes
+        assert paged.final_stats.utilization > dense.final_stats.utilization
+
+    def test_block_manager_returns_everything_between_runs(self, paged_engine, tokenizer):
+        """No leaks across generate() calls.
+
+        A block that escapes the free list shrinks the cache silently, and the
+        symptom is a server that admits fewer requests the longer it runs.
+        """
+        manager = paged_engine.block_manager
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        paged_engine.generate(prompt_ids, max_tokens=8)
+        manager.check_invariants()
+        used_after_first = manager.num_used_blocks
+        paged_engine.generate(prompt_ids, max_tokens=8)
+        manager.check_invariants()
+        assert manager.num_used_blocks == used_after_first
+
+
+class TestPagedMemory:
+    def test_utilization_clears_the_phase_2_bar(self, paged_engine, tokenizer):
+        """Waste is bounded by the last partial block, not by max_seq_len.
+
+        The bound is ``block_size - 1`` tokens per sequence, so utilization
+        rises toward 100% as sequences lengthen. Short generations are dominated
+        by that partial block, which is why the threshold here is modest and the
+        trend matters more than the point.
+        """
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        short = paged_engine.generate(prompt_ids, max_tokens=16).final_stats
+        longer = paged_engine.generate(prompt_ids, max_tokens=64).final_stats
+        assert short.utilization > 0.50
+        assert longer.utilization > short.utilization
+
+    def test_never_exceeds_the_block_size_waste_bound(self, paged_engine, tokenizer):
+        """At most ``block_size - 1`` wasted token slots per sequence."""
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        stats = paged_engine.generate(prompt_ids, max_tokens=32).final_stats
+        per_token = paged_engine.config.model.kv_bytes_per_token(paged_engine.config.dtype)
+        wasted_slots = stats.wasted_bytes / per_token
+        block_size = paged_engine.config.cache.block_size
+        assert wasted_slots <= len(GOLDEN_PROMPTS) * (block_size - 1)
+
+
 class TestMemoryInstrumentation:
     """The utilization ratio is the whole point of Phase 1."""
 
-    def test_utilization_is_low_with_a_contiguous_cache(self, engine, tokenizer):
+    def test_utilization_is_low_with_a_contiguous_cache(self, dense_engine, tokenizer):
         # Short sequences in a cache sized for long ones. The vLLM paper
         # measured 20.4%-38.2% effective utilization in existing systems; a
         # contiguous reservation should land in that neighbourhood or below.
         prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
-        out = engine.generate(prompt_ids, max_tokens=16)
+        out = dense_engine.generate(prompt_ids, max_tokens=16)
         stats = out.final_stats
         assert stats is not None
         assert stats.utilization is not None
@@ -227,25 +323,25 @@ class TestMemoryInstrumentation:
             f"would understate the very waste this arm exists to measure."
         )
 
-    def test_live_bytes_grow_as_tokens_are_generated(self, engine, tokenizer):
-        out = engine.generate([tokenizer("The capital of France is").input_ids], max_tokens=8)
+    def test_live_bytes_grow_as_tokens_are_generated(self, dense_engine, tokenizer):
+        out = dense_engine.generate([tokenizer("The capital of France is").input_ids], max_tokens=8)
         live = [s.live_bytes for s in out.step_stats]
         assert live == sorted(live), "live bytes must be non-decreasing"
         assert live[-1] > live[0]
 
-    def test_allocated_bytes_never_change_during_a_run(self, engine, tokenizer):
+    def test_allocated_bytes_never_change_during_a_run(self, dense_engine, tokenizer):
         """The reservation is made once at startup, never grown in the loop."""
-        out = engine.generate([tokenizer("hello world").input_ids], max_tokens=8)
+        out = dense_engine.generate([tokenizer("hello world").input_ids], max_tokens=8)
         allocated = {s.allocated_bytes for s in out.step_stats}
         assert len(allocated) == 1
 
-    def test_utilization_matches_the_hand_computation(self, engine, tokenizer):
+    def test_utilization_matches_the_hand_computation(self, dense_engine, tokenizer):
         """Cross-check the instrumentation against the arithmetic by hand."""
         ids = tokenizer("The capital of France is").input_ids
-        out = engine.generate([ids], max_tokens=8)
+        out = dense_engine.generate([ids], max_tokens=8)
         stats = out.final_stats
-        model = engine.config.model
-        per_token = model.kv_bytes_per_token(engine.config.dtype)
+        model = dense_engine.config.model
+        per_token = model.kv_bytes_per_token(dense_engine.config.dtype)
 
         # Minus one: generating N tokens takes N forward passes, and the last
         # token sampled never goes back through the model, so its K and V are
@@ -254,5 +350,7 @@ class TestMemoryInstrumentation:
         cached_tokens = len(ids) + len(out.token_ids[0]) - 1
         assert stats.live_bytes == cached_tokens * per_token
 
-        expected_alloc = 1 * engine.config.cache.max_seq_len * per_token
+        # Sized to the server's configured capacity, not to this batch.
+        cache = dense_engine.config.cache
+        expected_alloc = cache.max_num_seqs * cache.max_seq_len * per_token
         assert stats.allocated_bytes == expected_alloc
