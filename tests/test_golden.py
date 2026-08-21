@@ -27,7 +27,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
-from pagedserve.config import CacheConfig  # noqa: E402
+from pagedserve.config import CacheConfig, SchedulerConfig  # noqa: E402
 from pagedserve.engine import LLMEngine  # noqa: E402
 
 # Small, ungated, and already cached on the dev machine, so this test needs no
@@ -354,3 +354,93 @@ class TestMemoryInstrumentation:
         cache = dense_engine.config.cache
         expected_alloc = cache.max_num_seqs * cache.max_seq_len * per_token
         assert stats.allocated_bytes == expected_alloc
+
+
+class TestContinuousBatching:
+    """Phase 3: iteration-level scheduling must not change what is produced.
+
+    Continuous batching is a throughput change, not a semantic one. If the
+    tokens differ from a static-batched run, the scheduler has a bug — the
+    comparison is against the same engine on the same backend, so nothing else
+    can account for a difference.
+    """
+
+    def reference(self, paged_engine, tokenizer):
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        return prompt_ids, paged_engine.generate(prompt_ids, max_tokens=MAX_NEW_TOKENS).token_ids
+
+    def test_matches_static_batching(self, model_path, paged_engine, tokenizer):
+        prompt_ids, expected = self.reference(paged_engine, tokenizer)
+        engine = build_engine(model_path, "gather")
+        sequences = engine.generate_continuous(prompt_ids, max_tokens=MAX_NEW_TOKENS)
+        assert [s.output_token_ids for s in sequences] == expected
+
+    def test_mixed_batch_composition_is_reached(self, model_path, tokenizer):
+        """One step really does hold a prefill and decodes at once."""
+        engine = build_engine(model_path, "gather")
+        engine.start()
+        engine.add_request(tokenizer(GOLDEN_PROMPTS[0]).input_ids, max_tokens=12)
+        engine.step()  # sequence 0 is now decoding
+        engine.add_request(tokenizer(GOLDEN_PROMPTS[1]).input_ids, max_tokens=12)
+        output = engine.step()
+        assert output.prefills and output.decodes
+        # Ragged: prefill length plus one decode token, not padded to the max.
+        assert output.num_batched_tokens == output.prefills[0].prompt_len + len(output.decodes)
+
+    def test_a_request_added_mid_flight_still_matches(self, model_path, tokenizer):
+        """Joining an in-progress batch must not perturb the joiner or the batch."""
+        engine = build_engine(model_path, "gather")
+        alone = engine.generate_continuous([tokenizer(GOLDEN_PROMPTS[1]).input_ids], max_tokens=16)[
+            0
+        ].output_token_ids
+
+        engine = build_engine(model_path, "gather")
+        engine.start()
+        engine.add_request(tokenizer(GOLDEN_PROMPTS[0]).input_ids, max_tokens=40)
+        for _ in range(5):
+            engine.step()
+        late = engine.add_request(tokenizer(GOLDEN_PROMPTS[1]).input_ids, max_tokens=16)
+        while engine.scheduler.num_unfinished:
+            engine.step()
+        assert late.output_token_ids == alone
+
+    @pytest.mark.parametrize("policy", ["recompute", "swap"])
+    def test_forced_preemption_is_invisible_in_the_output(
+        self, model_path, paged_engine, tokenizer, policy
+    ):
+        """The Phase 3 exit criterion, for both policies.
+
+        The cache is starved so eviction is unavoidable, and the resumed
+        sequences must produce exactly what an unpreempted run produced. A
+        preemption that changes a token is a correctness bug wearing an
+        optimisation's clothes.
+        """
+        prompt_ids, expected = self.reference(paged_engine, tokenizer)
+        starved = LLMEngine.from_pretrained(
+            model_path,
+            device="cpu",
+            dtype="float32",
+            cache=CacheConfig(
+                max_seq_len=256,
+                max_num_seqs=8,
+                block_size=16,
+                num_blocks_override=6,
+                swap_space_blocks=64,
+            ),
+            scheduler=SchedulerConfig(
+                max_num_batched_tokens=2048, max_num_seqs=8, preemption_policy=policy
+            ),
+            attn_backend="gather",
+            debug_invariants=True,
+        )
+        sequences = starved.generate_continuous(prompt_ids, max_tokens=MAX_NEW_TOKENS)
+        assert starved.scheduler.num_preemptions > 0, "the cache was not starved enough"
+        assert [s.output_token_ids for s in sequences] == expected
+        starved.block_manager.check_invariants()
+
+    def test_blocks_are_all_returned_when_the_run_ends(self, model_path, tokenizer):
+        engine = build_engine(model_path, "gather")
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        engine.generate_continuous(prompt_ids, max_tokens=12)
+        engine.scheduler.free_finished()
+        engine.block_manager.check_invariants()

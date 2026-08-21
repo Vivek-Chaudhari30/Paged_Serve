@@ -280,7 +280,25 @@ pytest                                 # on a GPU machine
 
 ## 7. Current status
 
-**Current phase: 2 — paged KV cache (Python gather path).**
+**Current phase: 3 — continuous batching scheduler.**
+
+Phase 3 deliverables:
+- [x] `core/scheduler.py` — waiting/running/swapped queues, `schedule()` every
+      iteration, admission budgeted on BOTH `max_num_batched_tokens` and
+      `max_num_seqs`
+- [x] Retire on EOS / max_tokens, freeing blocks in the same step
+- [x] `core/policy.py` — RECOMPUTE and SWAP, selectable by config, tail
+      victim selection with the fairness tradeoff documented
+- [x] Ragged batch assembly — one step mixes prefills of different lengths with
+      single-token decodes, flattened with cumulative sequence lengths, no padding
+- [x] Forced-preemption tests for BOTH policies: resumed sequences produce
+      output identical to an unpreempted run
+- [ ] Full concurrency sweep committed to `results/` — **needs a GPU.**
+
+Continuous batching output is token-identical to static batching, and stays
+identical under forced preemption with either policy.
+
+**Previous phase: 2 — paged KV cache (Python gather path).**
 
 Phase 2 deliverables:
 - [x] `memory/block.py`, `memory/block_manager.py` — free list, block tables,

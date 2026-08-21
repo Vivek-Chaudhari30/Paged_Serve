@@ -43,7 +43,7 @@ from pagedserve.config import CacheConfig, ModelConfig
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["PagedAttentionBackend", "PagedMetadata"]
+__all__ = ["PagedAttentionBackend", "PagedMetadata", "RaggedMetadata"]
 
 
 @dataclass(frozen=True)
@@ -69,6 +69,50 @@ class PagedMetadata(AttentionMetadata):
     gathered_len: int
     live_tokens: int
     used_blocks: int
+
+
+@dataclass(frozen=True)
+class RaggedMetadata(AttentionMetadata):
+    """Per-step state for a batch that mixes prefills and decodes.
+
+    Continuous batching means one step can hold a 500-token prefill, a
+    7-token prefill, and thirty single-token decodes. Padding them to a common
+    length would waste compute proportional to the spread, which on a
+    heavy-tailed workload is most of the batch.
+
+    Instead every token in the step is flattened into one sequence of length
+    ``sum(query_lens)``, exactly the varlen layout FlashAttention's API wants —
+    so the Phase 4 kernel drops into the same shape. ``query_offsets`` is the
+    cumulative-sequence-length array that makes the flattening addressable.
+
+    Attributes:
+        query_lens: Tokens contributed by each sequence this step.
+        query_offsets: Exclusive prefix sum of ``query_lens``; where each
+            sequence's tokens begin in the flattened batch.
+        seq_lens: Total real tokens per sequence after this step.
+        decode_rows: Indices of sequences contributing exactly one token. These
+            are batched into a single attention call with zero padding, because
+            decode is the steady state and the hot path.
+        prefill_rows: Indices contributing more than one. Handled one at a time;
+            see ``PagedAttentionBackend.forward`` for why that is acceptable
+            here and what replaces it.
+    """
+
+    slot_mapping: torch.Tensor
+    block_tables: torch.Tensor
+    query_lens: tuple[int, ...]
+    query_offsets: tuple[int, ...]
+    seq_lens: torch.Tensor
+    query_positions: torch.Tensor
+    decode_rows: tuple[int, ...]
+    prefill_rows: tuple[int, ...]
+    gathered_len: int
+    live_tokens: int
+    used_blocks: int
+
+    @property
+    def total_tokens(self) -> int:
+        return sum(self.query_lens)
 
 
 class PagedAttentionBackend(AttentionBackend):
@@ -202,9 +246,11 @@ class PagedAttentionBackend(AttentionBackend):
         value: torch.Tensor,
         metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        assert isinstance(metadata, PagedMetadata)
         if self.kv_cache is None:
             raise RuntimeError("allocate() must be called before forward()")
+        if isinstance(metadata, RaggedMetadata):
+            return self._forward_ragged(layer_idx, query, key, value, metadata)
+        assert isinstance(metadata, PagedMetadata)
 
         num_seqs, query_len = query.shape[0], query.shape[1]
         kv_heads, head_dim = self.model.num_kv_heads, self.model.head_dim
@@ -261,3 +307,132 @@ class PagedAttentionBackend(AttentionBackend):
         if self.kv_cache is None:
             return 0
         return self.kv_cache.numel() * self.kv_cache.element_size()
+
+    # ---- ragged path (Phase 3) -----------------------------------------
+
+    def _forward_ragged(
+        self,
+        layer_idx: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        md: RaggedMetadata,
+    ) -> torch.Tensor:
+        """Attention over a batch mixing prefills and single-token decodes.
+
+        Inputs arrive as ``[1, total_tokens, heads, head_dim]`` — the model ran
+        on a flattened batch, so no position was padded and every projection,
+        norm, and MLP saw exactly the real tokens.
+
+        Attention is where the shapes stop being uniform, and it is split in two:
+
+        - **All decodes in one call.** They share ``query_len == 1``, so they
+          batch with zero padding. Decode is the steady state — it runs on every
+          step for every live sequence — so this is the path that must not have
+          a Python loop in it.
+        - **Prefills one at a time.** Their lengths differ, and a single dense
+          call would need padding to the longest. A prefill happens once per
+          request while decodes happen thousands of times, so the loop sits on
+          the cold path by construction. Phase 4 replaces it with
+          ``flash_attn_varlen_func``, which is exactly why this metadata already
+          carries cumulative sequence lengths.
+        """
+        kv_heads, head_dim = self.model.num_kv_heads, self.model.head_dim
+        num_q_heads = self.model.num_q_heads
+
+        flat_q = query.reshape(-1, num_q_heads, head_dim)
+        flat_k = key.reshape(-1, kv_heads, head_dim)
+        flat_v = value.reshape(-1, kv_heads, head_dim)
+
+        # Write is layout-agnostic: one fused scatter, ragged or not.
+        k_cache = self.kv_cache[layer_idx, 0].view(-1, kv_heads, head_dim)
+        v_cache = self.kv_cache[layer_idx, 1].view(-1, kv_heads, head_dim)
+        k_cache.index_copy_(0, md.slot_mapping, flat_k)
+        v_cache.index_copy_(0, md.slot_mapping, flat_v)
+
+        out = torch.empty_like(flat_q)
+        repeats = self.model.num_queries_per_kv
+
+        if md.decode_rows:
+            rows = torch.tensor(md.decode_rows, dtype=torch.long, device=self.device)
+            starts = torch.tensor(
+                [md.query_offsets[r] for r in md.decode_rows],
+                dtype=torch.long,
+                device=self.device,
+            )
+            keys, values = self._gather(layer_idx, md.block_tables[rows], len(md.decode_rows))
+            # [n, heads, dim] -> [n, heads, 1, dim]: one query row per sequence.
+            q = flat_q[starts].unsqueeze(2)
+            bias = self._ragged_bias(md, md.decode_rows, query_len=1, gathered_len=md.gathered_len)
+            attended = self._sdpa(q, keys, values, bias, repeats)
+            out[starts] = attended[:, :, 0]
+
+        for row in md.prefill_rows:
+            start = md.query_offsets[row]
+            length = md.query_lens[row]
+            keys, values = self._gather(layer_idx, md.block_tables[row : row + 1], 1)
+            q = flat_q[start : start + length].unsqueeze(0).transpose(1, 2)
+            bias = self._ragged_bias(md, (row,), query_len=length, gathered_len=md.gathered_len)
+            attended = self._sdpa(q, keys, values, bias, repeats)
+            out[start : start + length] = attended[0].transpose(0, 1)
+
+        return out.view(1, -1, num_q_heads, head_dim)
+
+    def _gather(
+        self, layer_idx: int, block_tables: torch.Tensor, num_seqs: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Copy the named blocks into a contiguous scratch buffer.
+
+        The slow step, and the whole reason Phase 4 exists.
+        """
+        kv_heads, head_dim = self.model.num_kv_heads, self.model.head_dim
+        flat = block_tables.reshape(-1)
+        gathered = block_tables.shape[1] * self.block_size
+        keys = (
+            self.kv_cache[layer_idx, 0]
+            .index_select(0, flat)
+            .view(num_seqs, gathered, kv_heads, head_dim)
+            .transpose(1, 2)
+        )
+        values = (
+            self.kv_cache[layer_idx, 1]
+            .index_select(0, flat)
+            .view(num_seqs, gathered, kv_heads, head_dim)
+            .transpose(1, 2)
+        )
+        return keys, values
+
+    def _sdpa(self, q, keys, values, bias, repeats: int) -> torch.Tensor:
+        if repeats > 1:
+            keys = keys.repeat_interleave(repeats, dim=1)
+            values = values.repeat_interleave(repeats, dim=1)
+        return F.scaled_dot_product_attention(q, keys, values, attn_mask=bias)
+
+    def _ragged_bias(
+        self, md: RaggedMetadata, rows: tuple[int, ...], *, query_len: int, gathered_len: int
+    ) -> torch.Tensor:
+        """Additive mask for a subset of the step's sequences.
+
+        Same two rules as the static paged path: a key is real only inside its
+        own sequence, and causality is enforced in logical space. The gathered
+        buffer is a whole number of blocks, so it exposes up to
+        ``block_size - 1`` slots holding a previous tenant's KV — masking those
+        is what stops one request reading another's data.
+        """
+        neg = torch.finfo(self.dtype).min
+        num = len(rows)
+        row_index = torch.tensor(rows, dtype=torch.long, device=self.device)
+
+        key_pos = torch.arange(gathered_len, device=self.device).view(1, 1, 1, gathered_len)
+        key_valid = key_pos < md.seq_lens[row_index].view(num, 1, 1, 1)
+
+        positions = []
+        for row in rows:
+            start = md.query_offsets[row]
+            positions.append(md.query_positions[start : start + query_len])
+        query_pos = torch.stack(positions).view(num, 1, query_len, 1)
+
+        allowed = key_valid & (key_pos <= query_pos)
+        return torch.zeros(
+            (num, 1, query_len, gathered_len), device=self.device, dtype=self.dtype
+        ).masked_fill_(~allowed, neg)

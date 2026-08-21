@@ -21,7 +21,7 @@ from pagedserve.config import CacheConfig, ModelConfig
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["blocks_from_budget", "bytes_per_block", "profile_num_blocks"]
+__all__ = ["SwapSpace", "blocks_from_budget", "bytes_per_block", "profile_num_blocks"]
 
 
 def bytes_per_block(model: ModelConfig, block_size: int, dtype: torch.dtype) -> int:
@@ -130,3 +130,115 @@ def profile_num_blocks(
         num_blocks * cache.block_size,
     )
     return num_blocks
+
+
+class SwapSpace:
+    """Host-side parking for the KV of preempted sequences.
+
+    SWAP preemption trades PCIe bandwidth for prefill compute: instead of
+    dropping a victim's blocks and recomputing its prompt later, copy them to
+    host memory, free the GPU blocks, and copy them back on resume. The cost is
+    two transfers of the sequence's KV; the saving is the whole re-prefill.
+
+    The host buffer is **pinned** when the device is CUDA. Pageable host memory
+    cannot be the target of an async DMA, so a copy out of it silently becomes
+    synchronous — the transfer would block the compute stream and turn a
+    background eviction into a stall in the decode loop, which is the opposite
+    of what preemption is for.
+
+    Copies run on a dedicated stream for the same reason: eviction should
+    overlap with the step that made room for it, not serialise against it.
+    """
+
+    def __init__(
+        self,
+        model: ModelConfig,
+        *,
+        num_cpu_blocks: int,
+        block_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.model = model
+        self.num_cpu_blocks = num_cpu_blocks
+        self.block_size = block_size
+        self.dtype = dtype
+        self.device = device
+
+        pin = device.type == "cuda"
+        self.cpu_cache = torch.zeros(
+            (
+                model.num_layers,
+                2,
+                num_cpu_blocks,
+                block_size,
+                model.num_kv_heads,
+                model.head_dim,
+            ),
+            dtype=dtype,
+            device="cpu",
+            pin_memory=pin,
+        )
+        self.free_cpu_blocks: list[int] = list(range(num_cpu_blocks))
+        self._stream = torch.cuda.Stream() if device.type == "cuda" else None
+        logger.info(
+            "allocated swap space: %d blocks, %.1f MiB, pinned=%s",
+            num_cpu_blocks,
+            self.cpu_cache.numel() * self.cpu_cache.element_size() / 2**20,
+            pin,
+        )
+
+    @property
+    def num_free_blocks(self) -> int:
+        return len(self.free_cpu_blocks)
+
+    def can_swap_out(self, num_blocks: int) -> bool:
+        return num_blocks <= self.num_free_blocks
+
+    def swap_out(self, gpu_cache: torch.Tensor, gpu_blocks: list[int]) -> list[int]:
+        """Copy GPU blocks to the host buffer and return their host block ids."""
+        if not self.can_swap_out(len(gpu_blocks)):
+            raise MemoryError(
+                f"swap space exhausted: need {len(gpu_blocks)} host blocks, "
+                f"{self.num_free_blocks} free"
+            )
+        cpu_blocks = [self.free_cpu_blocks.pop() for _ in gpu_blocks]
+        source = torch.tensor(gpu_blocks, dtype=torch.long, device=gpu_cache.device)
+        destination = torch.tensor(cpu_blocks, dtype=torch.long)
+        with self._maybe_stream():
+            for layer in range(self.model.num_layers):
+                for kv in (0, 1):
+                    picked = gpu_cache[layer, kv].index_select(0, source)
+                    self.cpu_cache[layer, kv].index_copy_(0, destination, picked.to("cpu"))
+        self._synchronize()
+        return cpu_blocks
+
+    def swap_in(
+        self, gpu_cache: torch.Tensor, cpu_blocks: list[int], gpu_blocks: list[int]
+    ) -> None:
+        """Copy host blocks back into freshly allocated GPU blocks."""
+        if len(cpu_blocks) != len(gpu_blocks):
+            raise ValueError(
+                f"swap_in needs one GPU block per host block, got "
+                f"{len(gpu_blocks)} and {len(cpu_blocks)}"
+            )
+        source = torch.tensor(cpu_blocks, dtype=torch.long)
+        destination = torch.tensor(gpu_blocks, dtype=torch.long, device=gpu_cache.device)
+        with self._maybe_stream():
+            for layer in range(self.model.num_layers):
+                for kv in (0, 1):
+                    picked = self.cpu_cache[layer, kv].index_select(0, source)
+                    gpu_cache[layer, kv].index_copy_(0, destination, picked.to(gpu_cache.device))
+        self._synchronize()
+        self.free_cpu_blocks.extend(cpu_blocks)
+
+    def _maybe_stream(self):
+        import contextlib
+
+        if self._stream is None:
+            return contextlib.nullcontext()
+        return torch.cuda.stream(self._stream)
+
+    def _synchronize(self) -> None:
+        if self._stream is not None:
+            torch.cuda.current_stream().wait_stream(self._stream)
