@@ -282,6 +282,28 @@ pytest                                 # on a GPU machine
 
 **Current phase: 3 — continuous batching scheduler.**
 
+### GPU verification status (Tesla T4, sm_75, torch 2.10+cu128, float16)
+
+Correctness is verified on real CUDA hardware. Nothing below is a benchmark —
+a Kaggle T4 is shared and unpinnable, so its timings are not evidence (§4).
+
+- [x] Golden gate: **39/39 pass on GPU**, both backends, in float16 *and* float32
+- [x] `profile_num_blocks` measurement branch (see the known gap below)
+- [x] `SwapSpace` round-trip through genuinely pinned host memory
+- [x] Paged and contiguous produce **bit-identical logits** (max diff 0.000000)
+- [x] Forced preemption invisible in the output, both policies
+- [x] Every configuration deterministic across repeated runs
+
+**Do not run on emulated bfloat16.** Turing has no native bf16, and
+`torch.cuda.is_bf16_supported()` returns True there anyway because it counts
+emulation. `resolve_dtype` picks by compute capability instead; anything that
+selects a dtype must ask it rather than reimplement the check.
+
+**Known gap:** `profile_num_blocks` runs no profiling forward pass, so
+activation memory counts as zero and the block count is optimistic — it handed
+13.1 GB of a 14.6 GiB card to KV. Pass `--num-blocks` explicitly for any run
+that must not OOM. A two-pass profile is the real fix.
+
 Phase 3 deliverables:
 - [x] `core/scheduler.py` — waiting/running/swapped queues, `schedule()` every
       iteration, admission budgeted on BOTH `max_num_batched_tokens` and
