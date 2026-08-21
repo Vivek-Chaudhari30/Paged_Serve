@@ -222,6 +222,51 @@ def main() -> int:
     print("  Reading: a gap of order 0.01 or less is a coin-flip that rounding")
     print("  decides. A gap of order 1 means the two backends genuinely computed")
     print("  different things, which is a bug.")
+
+    # ---- question 3: is token-for-token equality even achievable in fp16? ----
+    print()
+    print("=" * 72)
+    print("  3. LOGIT AGREEMENT vs ARGMAX MARGIN")
+    print("=" * 72)
+    print("  The paged path attends over a buffer padded to a whole number of")
+    print("  blocks, so SDPA gets a different shape than the contiguous path and")
+    print("  picks a different kernel with a different reduction order. The two")
+    print("  therefore agree only to the precision of the dtype. If the typical")
+    print("  disagreement between them is LARGER than the typical margin between")
+    print("  the top two logits, then some argmax will flip -- not sometimes, but")
+    print("  necessarily -- and token-for-token equality is not a property")
+    print("  float16 can deliver between two correct implementations.")
+    print()
+    for dtype in ("float16", "float32"):
+        dense_engine = build(args.model, "contiguous", dtype, "cuda")
+        paged_engine = build(args.model, "gather", dtype, "cuda")
+        diffs, margins, flippable = [], [], 0
+        for prompt in PROMPTS:
+            ids = tokenizer(prompt).input_ids
+            for extra in range(0, 12, 3):
+                prefix = ids + [tokenizer.eos_token_id] * 0 + ids[:extra]
+                a = dense_engine.logits_for(prefix).float()
+                b = paged_engine.logits_for(prefix).float()
+                diff = (a - b).abs().max().item()
+                top = torch.topk(a, 2).values
+                margin = (top[0] - top[1]).item()
+                diffs.append(diff)
+                margins.append(margin)
+                if diff >= margin:
+                    flippable += 1
+        print(f"  {dtype}:")
+        print(f"      max |logit difference| between backends : {max(diffs):.6f}")
+        print(
+            f"      median top-1/top-2 margin               : "
+            f"{sorted(margins)[len(margins) // 2]:.6f}"
+        )
+        print(f"      smallest margin seen                    : {min(margins):.6f}")
+        print(f"      positions where difference >= margin    : {flippable}/{len(diffs)}")
+        del dense_engine, paged_engine
+        torch.cuda.empty_cache()
+    print()
+    print("  Any position in that last row is one where the two backends must")
+    print("  disagree on the sampled token, however correct both of them are.")
     return 0
 
 
