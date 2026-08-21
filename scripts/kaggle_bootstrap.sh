@@ -52,9 +52,17 @@ python --version
 
 echo "==> checkout"
 if [ -d "${CHECKOUT}/.git" ]; then
-    git -C "${CHECKOUT}" fetch --depth 1 origin "${REPO_BRANCH}"
-    git -C "${CHECKOUT}" checkout -f "${REPO_BRANCH}"
-    git -C "${CHECKOUT}" reset --hard "origin/${REPO_BRANCH}"
+    # An explicit refspec is required. A shallow clone made with --branch main
+    # configures a refspec for main ALONE, so `fetch origin <other-branch>`
+    # lands in FETCH_HEAD and creates no ref to check out -- the checkout then
+    # fails with a bare "pathspec did not match", which reads like a typo
+    # rather than a missing ref.
+    git -C "${CHECKOUT}" fetch --depth 1 origin \
+        "+refs/heads/${REPO_BRANCH}:refs/remotes/origin/${REPO_BRANCH}"
+    git -C "${CHECKOUT}" checkout -f -B "${REPO_BRANCH}" \
+        "refs/remotes/origin/${REPO_BRANCH}"
+    git -C "${CHECKOUT}" reset --hard "refs/remotes/origin/${REPO_BRANCH}"
+    git -C "${CHECKOUT}" clean -fd
 else
     git clone --depth 1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${CHECKOUT}"
 fi
