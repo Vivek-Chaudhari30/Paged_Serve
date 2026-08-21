@@ -84,8 +84,10 @@ class RequestRecord:
             but TTFT, E2E, and TPOT are not.
         finish: Timestamp of the last output token, or ``None`` if the request
             never completed (in flight at shutdown, cancelled, or errored).
-        prompt_tokens: Prompt length in tokens. Needed to interpret TTFT, since
-            prefill cost is roughly linear in it.
+        prompt_tokens: Prompt length in tokens, or ``None`` when no tokenizer
+            was available to count it. Needed to interpret TTFT, since prefill
+            cost is roughly linear in it. ``None`` rather than ``0`` so that an
+            uncounted prompt cannot masquerade as an empty one.
         output_tokens: Number of tokens generated.
         error: Failure reason, or ``None``. A record with an error is excluded
             from latency statistics and counted separately, never silently
@@ -96,7 +98,7 @@ class RequestRecord:
     first_token: float | None = None
     tokens: list[float] = field(default_factory=list)
     finish: float | None = None
-    prompt_tokens: int = 0
+    prompt_tokens: int | None = None
     output_tokens: int = 0
     error: str | None = None
 
@@ -161,7 +163,7 @@ class RequestRecord:
             first_token=d.get("first_token"),
             tokens=list(d.get("tokens") or []),
             finish=d.get("finish"),
-            prompt_tokens=d.get("prompt_tokens", 0),
+            prompt_tokens=d.get("prompt_tokens"),
             output_tokens=d.get("output_tokens", 0),
             error=d.get("error"),
         )
@@ -217,7 +219,7 @@ def validate_record(record: RequestRecord) -> list[str]:
     generator calls this and logs, tests call this and assert.
     """
     problems: list[str] = []
-    if record.prompt_tokens < 0:
+    if record.prompt_tokens is not None and record.prompt_tokens < 0:
         problems.append(f"prompt_tokens is negative: {record.prompt_tokens}")
     if record.output_tokens < 0:
         problems.append(f"output_tokens is negative: {record.output_tokens}")
@@ -344,7 +346,14 @@ def summarize(
     itls = [gap for r in succeeded for gap in r.itls]
 
     total_output_tokens = sum(r.output_tokens for r in succeeded)
-    total_prompt_tokens = sum(r.prompt_tokens for r in succeeded)
+    # All-or-nothing: if any request could not report its prompt length, a sum
+    # over the rest silently understates the total, and prompt throughput
+    # derived from it would be a number nobody measured. Report null instead.
+    total_prompt_tokens: int | None = (
+        sum(r.prompt_tokens or 0 for r in succeeded)
+        if succeeded and all(r.prompt_tokens is not None for r in succeeded)
+        else None
+    )
 
     if duration is None:
         duration = _observed_duration(records)
@@ -365,7 +374,11 @@ def summarize(
 
     usable_duration = duration is not None and duration > 0.0
     summary["output_throughput"] = total_output_tokens / duration if usable_duration else None
-    summary["prompt_throughput"] = total_prompt_tokens / duration if usable_duration else None
+    summary["prompt_throughput"] = (
+        total_prompt_tokens / duration
+        if usable_duration and total_prompt_tokens is not None
+        else None
+    )
     summary["request_throughput"] = len(succeeded) / duration if usable_duration else None
 
     if slo is not None and not slo.is_empty():

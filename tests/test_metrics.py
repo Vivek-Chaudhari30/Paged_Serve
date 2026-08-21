@@ -295,6 +295,30 @@ class TestSummarize:
         assert s["ttft_p50"] == pytest.approx(0.6)
         assert s["total_output_tokens"] == 5
 
+    def test_unknown_prompt_lengths_give_null_prompt_totals(self):
+        # A backend with no tokenizer cannot report prompt lengths. Summing the
+        # unknowns as zero would publish a prompt_throughput of 0.0, which reads
+        # as a measurement rather than an absence.
+        a = RequestRecord(
+            arrival=0.0, first_token=1.0, tokens=[1.0, 2.0], finish=2.0, output_tokens=2
+        )
+        s = summarize([a])
+        assert a.prompt_tokens is None
+        assert s["total_prompt_tokens"] is None
+        assert s["prompt_throughput"] is None
+        # Output-side numbers are unaffected: those were measured.
+        assert s["total_output_tokens"] == 2
+        assert s["output_throughput"] == pytest.approx(1.0)
+
+    def test_partially_known_prompt_lengths_are_also_null(self):
+        # A partial sum understates the total, so it is not reported at all.
+        unknown = RequestRecord(
+            arrival=0.0, first_token=1.0, tokens=[1.0, 2.0], finish=2.0, output_tokens=2
+        )
+        s = summarize([REQUEST_A, unknown])
+        assert s["total_prompt_tokens"] is None
+        assert s["prompt_throughput"] is None
+
     def test_goodput_requires_an_slo(self):
         s = summarize([REQUEST_A, REQUEST_B])
         assert s["goodput"] is None
