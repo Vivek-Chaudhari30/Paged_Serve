@@ -283,12 +283,14 @@ pytest                                 # on a GPU machine
 **Current phase: 0 — environment, baseline, and the measurement harness.**
 
 Phase 0 deliverables:
-- [ ] `pyproject.toml`, package skeleton, ruff config
-- [ ] `bench/metrics.py` — percentile computation from raw per-request timings
-- [ ] `bench/loadgen.py` — Poisson and closed-loop modes, pluggable backend
-- [ ] `bench/baseline_hf.py` — HuggingFace sequential and static-batched baselines
-- [ ] `scripts/kaggle_bootstrap.sh` and `scripts/explorer_job.sbatch`
-- [ ] First baseline sweep committed to `results/`
+- [x] `pyproject.toml`, package skeleton, ruff config
+- [x] `bench/metrics.py` — percentile computation from raw per-request timings
+- [x] `bench/loadgen.py` — Poisson and closed-loop modes, pluggable backend
+- [x] `bench/baseline_hf.py` — HuggingFace sequential and static-batched baselines
+- [x] `scripts/kaggle_bootstrap.sh` and `scripts/explorer_job.sbatch`
+- [ ] First baseline sweep committed to `results/` — **needs a GPU; cannot be
+      closed on macOS.** Everything above is verified on CPU against a tiny
+      random-init Llama, which exercises the logic but measures nothing.
 
 Do not begin Phase 1 until every box is checked and the user confirms.
 

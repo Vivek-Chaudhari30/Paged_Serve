@@ -440,7 +440,25 @@ def _build_backend(name: str, args: argparse.Namespace) -> BackendFn:
     """
     if name == "mock":
         return MockBackend(ttft=args.mock_ttft, itl=args.mock_itl)
-    raise ValueError(f"unknown backend {name!r} (available: mock)")
+    if name == "hf":
+        # Imported lazily: this module must stay importable on a machine with
+        # no torch, and the harness is tested there (AGENTS.md section 4).
+        from bench.baseline_hf import BaselineConfig, HFBaselineBackend, load_model_and_tokenizer
+
+        if not args.model:
+            raise ValueError("--model is required for the hf backend")
+        config = BaselineConfig(
+            model=args.model,
+            device=args.device,
+            dtype=args.dtype,
+            # Sequential is static batching with a batch of one, so the two
+            # modes share a single timing path and stay comparable.
+            max_batch_size=1 if args.baseline_mode == "sequential" else args.concurrency,
+            batch_timeout=args.batch_timeout,
+        )
+        model, tokenizer = load_model_and_tokenizer(config)
+        return HFBaselineBackend(model, tokenizer, config)
+    raise ValueError(f"unknown backend {name!r} (available: mock, hf)")
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -467,6 +485,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--slo-tpot", type=float, default=None, help="Goodput TPOT bound (sec).")
     parser.add_argument("--slo-e2e", type=float, default=None, help="Goodput E2E bound (sec).")
     parser.add_argument("--output", default=None, help="Result JSON path.")
+    parser.add_argument("--model", default=None, help="Model id or path for the hf backend.")
+    parser.add_argument("--device", default=None, help="Override device (cuda/mps/cpu).")
+    parser.add_argument("--dtype", default=None, help="Override dtype (bfloat16/float16/float32).")
+    parser.add_argument(
+        "--baseline-mode",
+        default="static",
+        choices=("sequential", "static"),
+        help="hf backend: sequential runs one request at a time; static batches up to "
+        "--concurrency requests together.",
+    )
+    parser.add_argument(
+        "--batch-timeout",
+        type=float,
+        default=0.05,
+        help="hf static batching: seconds to wait for a batch to fill.",
+    )
     parser.add_argument("--mock-ttft", type=float, default=0.01)
     parser.add_argument("--mock-itl", type=float, default=0.001)
     return parser.parse_args(argv)
@@ -485,15 +519,28 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
         prompts = synthetic_prompts(args.num_requests, max_tokens=args.max_tokens)
         dataset_name = "synthetic"
 
+    # A backend that owns a tokenizer can fill in the prompt lengths the dataset
+    # loader refused to guess, which is what makes prompt throughput reportable.
+    tokenizer = getattr(backend, "tokenizer", None)
+    if tokenizer is not None:
+        from bench.baseline_hf import tokenize_prompts
+
+        prompts = tokenize_prompts(prompts, tokenizer)
+
     lag: DispatchLag | None = None
-    if args.mode == "poisson":
-        records, lag = await run_open_loop(
-            backend, prompts, rate=args.rate, rng=rng, duration=args.duration
-        )
-    else:
-        records = await run_closed_loop(
-            backend, prompts, concurrency=args.concurrency, duration=args.duration
-        )
+    try:
+        if args.mode == "poisson":
+            records, lag = await run_open_loop(
+                backend, prompts, rate=args.rate, rng=rng, duration=args.duration
+            )
+        else:
+            records = await run_closed_loop(
+                backend, prompts, concurrency=args.concurrency, duration=args.duration
+            )
+    finally:
+        aclose = getattr(backend, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
     slo = SLO(ttft=args.slo_ttft, tpot=args.slo_tpot, e2e=args.slo_e2e)
     workload: dict[str, Any] = {
@@ -508,11 +555,23 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
     if lag is not None:
         workload["dispatch_lag"] = lag.to_dict()
 
+    # Evidence that a batching backend actually batched. Without this, a static
+    # batching run that silently degraded to batches of one would be
+    # indistinguishable from a sequential run in the result file.
+    batch_sizes = getattr(backend, "batch_sizes", None)
+    if batch_sizes:
+        workload["batching"] = {
+            "num_batches": len(batch_sizes),
+            "mean_batch_size": sum(batch_sizes) / len(batch_sizes),
+            "max_batch_size": max(batch_sizes),
+        }
+
     return build_result(
         records,
         config={
             "backend": args.backend,
             "mode": args.mode,
+            "backend_config": (backend.config.to_dict() if hasattr(backend, "config") else None),
             # The engine config dump lands here once an engine exists to dump.
             "engine": None,
         },
