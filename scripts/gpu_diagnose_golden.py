@@ -55,6 +55,53 @@ def build(model: str, backend: str, dtype: str, device: str):
     )
 
 
+def hf_reference(path: str, prompts: list[str], max_tokens: int, dtype: str) -> list[list[int]]:
+    """HuggingFace greedy output, with the checkpoint's sampling knobs removed.
+
+    Qwen2.5 ships repetition_penalty=1.1 and generate() applies logits
+    processors even when do_sample is False, so an un-neutralised reference is
+    a different algorithm entirely.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+
+    from bench.baseline_hf import dtype_kwarg
+
+    tokenizer = AutoTokenizer.from_pretrained(path)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = (
+        AutoModelForCausalLM.from_pretrained(path, **dtype_kwarg(getattr(torch, dtype)))
+        .to("cuda")
+        .eval()
+    )
+    encoded = tokenizer(prompts, return_tensors="pt", padding=True).to("cuda")
+    config = GenerationConfig(
+        max_new_tokens=max_tokens,
+        do_sample=False,
+        repetition_penalty=1.0,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    with torch.inference_mode():
+        out = model.generate(**encoded, generation_config=config)
+    rows = out[:, encoded["input_ids"].shape[1] :].tolist()
+    eos = tokenizer.eos_token_id
+    eos_ids = set(eos) if isinstance(eos, list) else {eos}
+    trimmed = []
+    for row in rows:
+        stop = len(row)
+        for i, token in enumerate(row):
+            if token in eos_ids:
+                stop = i + 1
+                break
+        trimmed.append(row[:stop])
+    del model
+    torch.cuda.empty_cache()
+    return trimmed
+
+
 def first_divergence(a: list[int], b: list[int]) -> int | None:
     for i, (x, y) in enumerate(zip(a, b, strict=False)):
         if x != y:
@@ -80,6 +127,30 @@ def main() -> int:
     tokenizer = AutoTokenizer.from_pretrained(path)
     prompt_ids = [tokenizer(p).input_ids for p in PROMPTS]
 
+    # ---- question 0: is the paged path even deterministic? ----
+    print("=" * 72)
+    print("  0. IS THE PAGED PATH DETERMINISTIC?")
+    print("=" * 72)
+    print("  Every padding token in a left-padded batch is written to the SAME")
+    print("  trash slot, so index_copy_ receives duplicate indices -- which")
+    print("  PyTorch documents as undefined behaviour on CUDA. If repeated runs")
+    print("  of identical input disagree, that race is the bug, and no amount of")
+    print("  dtype analysis will explain it.")
+    print()
+    for dtype in ("float16", "float32"):
+        for backend in ("contiguous", "gather"):
+            engine = build(args.model, backend, dtype, "cuda")
+            runs = [
+                tuple(tuple(t) for t in engine.generate(prompt_ids, max_tokens=MAX_TOKENS).token_ids)
+                for _ in range(5)
+            ]
+            unique = len(set(runs))
+            verdict = "deterministic" if unique == 1 else f"NONDETERMINISTIC ({unique} distinct)"
+            print(f"  {dtype:>9} {backend:>11}: {verdict}")
+            del engine
+            torch.cuda.empty_cache()
+    print()
+
     # ---- question 1: does the disagreement survive in float32? ----
     print("=" * 72)
     print("  1. PAGED vs CONTIGUOUS, SAME GPU, BOTH DTYPES")
@@ -94,7 +165,12 @@ def main() -> int:
         )
         agree = dense.token_ids == paged.token_ids
         outcomes[dtype] = agree
-        print(f"  {dtype:>9}: backends agree = {agree}")
+        reference = hf_reference(path, PROMPTS, MAX_TOKENS, dtype)
+        print(
+            f"  {dtype:>9}: paged==contiguous {agree} | "
+            f"contiguous==HF {dense.token_ids == reference} | "
+            f"paged==HF {paged.token_ids == reference}"
+        )
         if not agree:
             pairs = zip(dense.token_ids, paged.token_ids, strict=True)
             for i, (d, p) in enumerate(pairs):
