@@ -140,10 +140,10 @@ def main() -> int:
     for dtype in ("float16", "float32"):
         for backend in ("contiguous", "gather"):
             engine = build(args.model, backend, dtype, "cuda")
-            runs = [
-                tuple(tuple(t) for t in engine.generate(prompt_ids, max_tokens=MAX_TOKENS).token_ids)
-                for _ in range(5)
-            ]
+            runs = []
+            for _ in range(5):
+                out = engine.generate(prompt_ids, max_tokens=MAX_TOKENS)
+                runs.append(tuple(tuple(t) for t in out.token_ids))
             unique = len(set(runs))
             verdict = "deterministic" if unique == 1 else f"NONDETERMINISTIC ({unique} distinct)"
             print(f"  {dtype:>9} {backend:>11}: {verdict}")
