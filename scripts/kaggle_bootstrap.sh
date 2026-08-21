@@ -109,6 +109,19 @@ python -c "import pagedserve; print('pagedserve', pagedserve.__version__)"
 python -c "import transformers; print('transformers', transformers.__version__)"
 pytest -q -m "not gpu"
 
+echo "==> build the CUDA extension"
+# An explicit step, not part of pip install: pip builds in an isolated
+# environment with no torch, so the extension would silently not build there
+# and the failure would surface later as an unexplained fallback.
+python setup.py build_ext --inplace 2>&1 | tail -20 \
+    || echo "CUDA BUILD FAILED - see above"
+python -c "
+from pagedserve.extension import is_available, unavailable_reason
+print('extension importable:', is_available())
+if not is_available():
+    print('reason:', unavailable_reason())"
+pytest tests/test_extension.py -q -m cuda_ext || echo "EXTENSION TESTS FAILED"
+
 echo "==> GPU smoke checks (the CUDA paths that have never run)"
 python scripts/gpu_smoke.py || echo "SOME GPU CHECKS FAILED - see above, this is the useful output"
 
