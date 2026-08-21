@@ -28,7 +28,9 @@ dev = ["pytest>=8.0", "ruff>=0.4", "matplotlib>=3.8"]
 all = ["pagedserve[engine,server,baseline,dev]"]
 
 [tool.setuptools.packages.find]
-include = ["pagedserve*"]
+# bench is installed too, so `python bench/loadgen.py` and `from bench.metrics
+# import ...` both work regardless of the current working directory.
+include = ["pagedserve*", "bench*"]
 
 [tool.ruff]
 line-length = 100
