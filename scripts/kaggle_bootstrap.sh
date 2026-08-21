@@ -59,6 +59,24 @@ else
     git clone --depth 1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${CHECKOUT}"
 fi
 cd "${CHECKOUT}"
+echo "checked out $(git rev-parse --abbrev-ref HEAD) at $(git rev-parse --short HEAD)"
+
+# A bootstrap fetched from one branch but cloning another is silent and
+# expensive: the run looks healthy while testing entirely different code.
+if [ ! -f scripts/gpu_smoke.py ]; then
+    cat >&2 <<WRONGBRANCH
+
+ERROR: this checkout has no scripts/gpu_smoke.py, so REPO_BRANCH=${REPO_BRANCH}
+does not contain the code you meant to test. Everything below would have
+exercised a different commit and reported healthy.
+
+Re-run with the branch set explicitly, e.g.
+
+    REPO_BRANCH=phase-3/continuous-batching bash <(curl -sSL <raw-url>)
+
+WRONGBRANCH
+    exit 1
+fi
 
 echo "==> install"
 # torch is preinstalled in these images and reinstalling it is a slow way to
@@ -71,9 +89,16 @@ import torch
 print("torch     ", torch.__version__)
 print("cuda      ", torch.version.cuda)
 print("gpu       ", torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)
-print("bf16      ", torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False)
+if torch.cuda.is_available():
+    cap = torch.cuda.get_device_capability(0)
+    print("compute   ", f"{cap[0]}.{cap[1]}")
+    # Native bf16 starts at Ampere. is_bf16_supported() counts emulation and
+    # returns True on a T4, which is correct and slow.
+    print("bf16 native", cap[0] >= 8)
+    print("bf16 reported", torch.cuda.is_bf16_supported())
 PY
 python -c "import pagedserve; print('pagedserve', pagedserve.__version__)"
+python -c "import transformers; print('transformers', transformers.__version__)"
 pytest -q -m "not gpu"
 
 echo "==> GPU smoke checks (the CUDA paths that have never run)"
