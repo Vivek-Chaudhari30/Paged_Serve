@@ -197,6 +197,12 @@ class CacheConfig:
     max_num_seqs: int = 32
     block_size: int = 16
     gpu_memory_utilization: float = 0.90
+    # Skips capacity profiling. Required off CUDA, where there is no way to
+    # measure free device memory and guessing one would put a fabricated number
+    # under every capacity decision.
+    num_blocks_override: int | None = None
+    # Host blocks for SWAP preemption. Only allocated when the policy needs it.
+    swap_space_blocks: int = 512
 
     def __post_init__(self) -> None:
         if self.max_seq_len < 1:
@@ -210,6 +216,8 @@ class CacheConfig:
             "max_num_seqs": self.max_num_seqs,
             "block_size": self.block_size,
             "gpu_memory_utilization": self.gpu_memory_utilization,
+            "num_blocks_override": self.num_blocks_override,
+            "swap_space_blocks": self.swap_space_blocks,
         }
 
 
