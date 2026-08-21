@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pagedserve"
+version = "0.0.0"
+description = "A from-scratch high-throughput LLM inference server: paged KV cache, continuous batching, custom CUDA paged attention."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Vivek" }]
+
+# Base install is deliberately light: the benchmark harness (bench/metrics.py,
+# bench/loadgen.py) must import and run on a laptop with no torch and no GPU.
+# Everything heavier lives behind an extra. See AGENTS.md section 4.
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+# The engine itself. Needed from Phase 1 onward.
+engine = ["torch>=2.2", "safetensors>=0.4"]
+# The HTTP layer. Phase 6.
+server = ["fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2.6"]
+# HuggingFace reference baseline and the golden test's oracle. Never a runtime
+# component of the engine itself.
+baseline = ["transformers>=4.40"]
+dev = ["pytest>=8.0", "ruff>=0.4", "matplotlib>=3.8"]
+all = ["pagedserve[engine,server,baseline,dev]"]
+
+[tool.setuptools.packages.find]
+include = ["pagedserve*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "T20", # flake8-print -- logging, not printing (AGENTS.md section 5)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Benchmark drivers and bootstrap scripts are CLIs; stdout is their interface.
+"bench/*" = ["T20"]
+"scripts/*" = ["T20"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "gpu: requires a CUDA GPU. Deselect on a Mac with -m 'not gpu'.",
+    "cuda_ext: requires the compiled CUDA extension (csrc/) to be importable.",
+]

@@ -1,0 +1,54 @@
+# ---- private design docs: never commit ----
+_private/
+*.private.md
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.env
+
+# ---- compiled cuda/c++ extension ----
+*.so
+*.o
+*.ninja*
+.ninja_deps
+.ninja_log
+csrc/build/
+
+# ---- pytest / tooling ----
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---- model weights & data (large, re-downloadable) ----
+models/
+weights/
+data/
+*.safetensors
+*.bin
+*.gguf
+
+# ---- benchmark artifacts ----
+# results/ IS committed - it is the evidence for every number in the README.
+# only ignore scratch runs:
+results/scratch/
+results/**/*.tmp.json
+*.nsys-rep
+*.ncu-rep
+
+# ---- slurm / notebook noise ----
+slurm-*.out
+*.err
+.ipynb_checkpoints/
+
+# ---- os ----
+.DS_Store
+Thumbs.db
