@@ -113,8 +113,16 @@ echo "==> GPU smoke checks (the CUDA paths that have never run)"
 python scripts/gpu_smoke.py || echo "SOME GPU CHECKS FAILED - see above, this is the useful output"
 
 echo "==> golden test on GPU, in this device's native dtype"
-PAGEDSERVE_TEST_DEVICE=cuda \
-PAGEDSERVE_TEST_DTYPE=$(python -c "import torch;print('bfloat16' if torch.cuda.is_bf16_supported() else 'float16')") \
+# Ask the engine which dtype it would actually use, rather than reimplementing
+# the check here. Reimplementing it is how this script ran the gate in EMULATED
+# bfloat16 on a Turing card while the library had already been fixed to choose
+# float16 -- and then reported the resulting argmax flips as a golden failure.
+GOLDEN_DTYPE=$(python -c "
+from pagedserve.config import resolve_device, resolve_dtype
+d = resolve_device(None)
+print(str(resolve_dtype(None, d)).removeprefix('torch.'))")
+echo "    using dtype ${GOLDEN_DTYPE}"
+PAGEDSERVE_TEST_DEVICE=cuda PAGEDSERVE_TEST_DTYPE="${GOLDEN_DTYPE}" \
     pytest tests/test_golden.py -q || echo "GOLDEN TEST FAILED ON GPU - this is a bug report"
 
 echo "==> smoke run (mock backend, proves the harness works here)"

@@ -69,6 +69,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def pytest_report_header() -> str:
+    """State the gate's configuration in the test output.
+
+    A golden failure means nothing without the device and dtype it was produced
+    under: the same code passes in float32, passes in float16, and flips argmax
+    on near-ties in emulated bfloat16.
+    """
+    return f"golden gate: device={TEST_DEVICE} dtype={TEST_DTYPE} model={GOLDEN_MODEL}"
+
+
 @pytest.fixture(scope="module")
 def model_path() -> str:
     from pagedserve.model.loader import resolve_model_path
