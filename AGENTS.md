@@ -280,7 +280,29 @@ pytest                                 # on a GPU machine
 
 ## 7. Current status
 
-**Current phase: 0 — environment, baseline, and the measurement harness.**
+**Current phase: 1 — naive engine with a contiguous KV cache.**
+
+Phase 1 deliverables:
+- [x] `model/loader.py` — safetensors into a state dict
+- [x] `model/layers.py` — RMSNorm, RoPE, GQA attention, SwiGLU
+- [x] `model/llama.py` — manual forward pass with KV cache write hooks
+- [x] `attention/backend.py` ABC + `attention/contiguous.py`
+- [x] Static batching loop, left padding, greedy decode
+- [x] Memory instrumentation: allocated vs live KV bytes
+- [x] `tests/test_golden.py` — token-for-token vs HuggingFace. **This is now
+      the commit gate.**
+
+Target model: `Qwen/Qwen2.5-0.5B-Instruct` (ungated, so no HF token is needed
+in any of the three environments). It is Llama-style but biases Q/K/V and ties
+its embeddings; both are read from the checkpoint, not branched on by name.
+
+Measured utilization: **2.1%** on an 8-prompt heavy-tailed batch with
+`max_seq_len=2048`, 32 new tokens each (CPU/fp32). The ratio is pure
+allocated-versus-live bookkeeping and so is device-independent, but it depends
+entirely on `max_seq_len` and the workload — quote both or the number means
+nothing.
+
+**Previous phase: 0 — environment, baseline, and the measurement harness.**
 
 Phase 0 deliverables:
 - [x] `pyproject.toml`, package skeleton, ruff config

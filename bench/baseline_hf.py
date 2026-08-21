@@ -44,9 +44,20 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GenerationConfig,
+    StoppingCriteria,
+    StoppingCriteriaList,
+)
 
+# Device and dtype resolution lives in pagedserve.config and nowhere else
+# (AGENTS.md section 4.1): the baseline and the engine must agree on what
+# hardware they are running on, or the comparison between them is not
+# controlled. Re-exported here so callers of this module need not care.
 from bench.loadgen import PromptRequest
+from pagedserve.config import resolve_device, resolve_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -88,36 +99,6 @@ class BaselineConfig:
             "batch_timeout": self.batch_timeout,
             "max_new_tokens_cap": self.max_new_tokens_cap,
         }
-
-
-def resolve_device(spec: str | None = None) -> torch.device:
-    """Pick a device once, here, so no other module has to guess.
-
-    Explicit spec wins. Otherwise CUDA, then Apple MPS, then CPU — the order the
-    three environments in AGENTS.md §4 appear in.
-    """
-    if spec:
-        return torch.device(spec)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def resolve_dtype(spec: str | None, device: torch.device) -> torch.dtype:
-    """Pick a dtype that the device can actually run.
-
-    bfloat16 is the default on CUDA, but Turing (T4) and Volta (V100) have no
-    bf16 support at all, so the fallback to fp16 is a correctness requirement,
-    not a preference. CPU and MPS get float32: bf16 on CPU is emulated and
-    slow enough to make a baseline meaningless.
-    """
-    if spec:
-        return getattr(torch, spec)
-    if device.type == "cuda":
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    return torch.float32
 
 
 def load_model_and_tokenizer(config: BaselineConfig) -> tuple[Any, Any]:
@@ -343,12 +324,24 @@ class HFBaselineBackend:
         # A static batch runs until its longest member is done. Every other
         # request in it holds memory and burns compute on padding until then.
         max_new = min(max(p.request.max_tokens for p in batch), self.config.max_new_tokens_cap)
+        # A checkpoint's generation_config.json can carry sampling defaults --
+        # Qwen2.5 ships repetition_penalty=1.1 -- and generate() applies its
+        # logits processors even when do_sample is False. Left alone, the
+        # baseline would run a penalty our engine does not, producing different
+        # tokens and quietly making the comparison unfair in both directions.
+        # Building the config from scratch replaces those defaults rather than
+        # layering overrides on top of them.
+        generation_config = GenerationConfig(
+            max_new_tokens=max_new,
+            do_sample=False,  # greedy: the golden test needs determinism
+            repetition_penalty=1.0,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
         with torch.inference_mode():
             output = self.model.generate(
                 **encoded,
-                max_new_tokens=max_new,
-                do_sample=False,  # greedy: the golden test needs determinism
-                pad_token_id=self.tokenizer.pad_token_id,
+                generation_config=generation_config,
                 stopping_criteria=StoppingCriteriaList([criteria]),
             )
         self._verify_streamed_counts(batch, criteria, output, encoded["input_ids"].shape[1])

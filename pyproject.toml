@@ -18,7 +18,7 @@ dependencies = ["numpy>=1.26"]
 
 [project.optional-dependencies]
 # The engine itself. Needed from Phase 1 onward.
-engine = ["torch>=2.2", "safetensors>=0.4"]
+engine = ["torch>=2.2", "safetensors>=0.4", "huggingface-hub>=0.23"]
 # The HTTP layer. Phase 6.
 server = ["fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2.6"]
 # HuggingFace reference baseline and the golden test's oracle. Never a runtime
