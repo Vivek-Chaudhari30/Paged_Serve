@@ -64,12 +64,13 @@ class TestBlockTable:
 
 class TestAllocation:
     def test_allocates_ceil_blocks(self, manager):
-        table = manager.allocate(seq_id=1, num_tokens=5)  # 5 tokens, block 4
+        table, _ = manager.allocate(seq_id=1, num_tokens=5)  # 5 tokens, block 4
         assert len(table) == 2
         assert manager.num_free_blocks == 6
 
     def test_zero_token_sequence_takes_nothing(self, manager):
-        assert len(manager.allocate(1, 0)) == 0
+        table, _ = manager.allocate(1, 0)
+        assert len(table) == 0
         assert manager.num_free_blocks == 8
 
     def test_double_allocation_is_an_error(self, manager):
@@ -78,12 +79,12 @@ class TestAllocation:
             manager.allocate(1, 4)
 
     def test_allocating_more_than_exists_raises(self, manager):
-        with pytest.raises(MemoryError, match="need 9 blocks"):
+        with pytest.raises(MemoryError, match="need 9 more blocks"):
             manager.allocate(1, 33)
 
     def test_blocks_are_not_handed_out_twice(self, manager):
-        first = set(manager.allocate(1, 16).blocks)
-        second = set(manager.allocate(2, 16).blocks)
+        first = set(manager.allocate(1, 16)[0].blocks)
+        second = set(manager.allocate(2, 16)[0].blocks)
         assert first.isdisjoint(second)
         assert manager.num_free_blocks == 0
 
@@ -174,7 +175,7 @@ class TestFree:
 
 class TestFork:
     def test_child_shares_the_parent_blocks(self, manager):
-        parent = manager.allocate(1, 8)
+        parent, _ = manager.allocate(1, 8)
         before = manager.num_free_blocks
         child = manager.fork(1, 2)
         # Sharing costs no new blocks -- the point of refcounting.
@@ -298,7 +299,7 @@ class TestFragmentation:
         manager.free(3)
         assert manager.num_free_blocks == 6
         # A 24-token sequence still gets admitted from the scattered remainder.
-        table = manager.allocate(5, 24)
+        table, _ = manager.allocate(5, 24)
         assert len(table) == 6
         manager.check_invariants()
 
@@ -324,3 +325,181 @@ class TestConstruction:
         # The trash block that left-padding tokens write into.
         assert manager.num_cache_blocks == manager.num_blocks + 1
         assert manager.trash_block_id == manager.num_blocks
+
+
+class TestCopyOnWrite:
+    """Giving a sequence a private copy of a block it shares.
+
+    Not reachable from prefix caching alone: only *full* blocks are cached and a
+    full block is never written to again. It exists for fork(), where n>1
+    sampling shares a partially filled block between samples that then diverge —
+    without the copy, the second writer would overwrite the first one's tokens
+    in place.
+    """
+
+    def test_exclusive_block_needs_no_copy(self, manager):
+        manager.allocate(1, 8)
+        assert manager.copy_on_write(1, 0) is None
+
+    def test_shared_block_is_copied(self, manager):
+        manager.allocate(1, 8)
+        manager.fork(1, 2)
+        original = manager.block_table(2).blocks[0]
+
+        result = manager.copy_on_write(2, 0)
+        assert result is not None
+        source, destination = result
+        assert source == original
+        assert destination != original
+        # The child now points at its own block; the parent is untouched.
+        assert manager.block_table(2).blocks[0] == destination
+        assert manager.block_table(1).blocks[0] == source
+
+    def test_the_source_loses_a_reference(self, manager):
+        manager.allocate(1, 8)
+        manager.fork(1, 2)
+        source = manager.block_table(1).blocks[0]
+        assert manager.blocks[source].ref_count == 2
+        manager.copy_on_write(2, 0)
+        assert manager.blocks[source].ref_count == 1
+
+    def test_the_copy_is_exclusively_owned(self, manager):
+        manager.allocate(1, 8)
+        manager.fork(1, 2)
+        _, destination = manager.copy_on_write(2, 0)
+        assert manager.blocks[destination].ref_count == 1
+
+    def test_copying_twice_is_a_no_op_the_second_time(self, manager):
+        manager.allocate(1, 8)
+        manager.fork(1, 2)
+        manager.copy_on_write(2, 0)
+        # Now exclusive, so nothing more to do.
+        assert manager.copy_on_write(2, 0) is None
+
+    def test_the_copy_is_not_reachable_as_a_cache_hit(self):
+        """Its contents are about to diverge from the prefix its hash names."""
+        from pagedserve.memory.prefix_cache import chain_hash
+
+        manager = BlockManager(8, BLOCK_SIZE, watermark=0.0, enable_prefix_caching=True)
+        manager.allocate(1, BLOCK_SIZE, token_ids=list(range(BLOCK_SIZE)))
+        manager.seal(1, list(range(BLOCK_SIZE)), BLOCK_SIZE)
+        block_hash = chain_hash(None, list(range(BLOCK_SIZE)))
+        assert manager.prefix_cache.lookup(block_hash) is not None
+
+        manager.fork(1, 2)
+        _, destination = manager.copy_on_write(2, 0)
+        assert not manager.prefix_cache.is_cached(destination)
+
+    def test_invariants_hold_after_a_copy(self, manager):
+        manager.allocate(1, 8)
+        manager.fork(1, 2)
+        manager.copy_on_write(2, 0)
+        manager.check_invariants()
+        manager.free(1)
+        manager.free(2)
+        manager.check_invariants()
+        assert manager.num_free_blocks == 8
+
+    def test_raises_when_there_is_nothing_to_copy_into(self):
+        manager = BlockManager(2, BLOCK_SIZE, watermark=0.0)
+        manager.allocate(1, BLOCK_SIZE * 2)  # takes both blocks
+        manager.fork(1, 2)
+        with pytest.raises(MemoryError):
+            manager.copy_on_write(2, 0)
+
+
+class TestPrefixReuse:
+    """Allocator-level prefix caching: reuse, sealing, and eviction."""
+
+    def cache_manager(self, num_blocks: int = 16) -> BlockManager:
+        return BlockManager(num_blocks, BLOCK_SIZE, watermark=0.0, enable_prefix_caching=True)
+
+    def test_nothing_is_reused_before_anything_is_sealed(self):
+        """Sealing follows the forward pass, so a first arrival cannot hit.
+
+        Two requests admitted in the same step cannot share either: no KV
+        exists yet for the blocks they would share.
+        """
+        manager = self.cache_manager()
+        tokens = list(range(BLOCK_SIZE * 2))
+        _, cached = manager.allocate(1, len(tokens), token_ids=tokens)
+        assert cached == 0
+
+    def test_a_later_request_reuses_a_sealed_prefix(self):
+        manager = self.cache_manager()
+        tokens = list(range(BLOCK_SIZE * 2))
+        manager.allocate(1, len(tokens), token_ids=tokens)
+        manager.seal(1, tokens, len(tokens))
+
+        _, cached = manager.allocate(2, len(tokens), token_ids=tokens)
+        # One token is held back so the forward pass has work to do.
+        assert cached == len(tokens) - 1
+        assert manager.block_table(2).blocks == manager.block_table(1).blocks
+
+    def test_reuse_shares_blocks_rather_than_allocating(self):
+        manager = self.cache_manager()
+        tokens = list(range(BLOCK_SIZE * 2))
+        manager.allocate(1, len(tokens), token_ids=tokens)
+        manager.seal(1, tokens, len(tokens))
+        before = manager.num_free_blocks
+        manager.allocate(2, len(tokens), token_ids=tokens)
+        assert manager.num_free_blocks == before
+        manager.check_invariants()
+
+    def test_a_divergent_prompt_reuses_only_the_shared_prefix(self):
+        manager = self.cache_manager()
+        shared = list(range(BLOCK_SIZE))
+        first = shared + [100] * BLOCK_SIZE
+        manager.allocate(1, len(first), token_ids=first)
+        manager.seal(1, first, len(first))
+
+        second = shared + [200] * BLOCK_SIZE
+        _, cached = manager.allocate(2, len(second), token_ids=second)
+        assert cached == BLOCK_SIZE
+        assert manager.block_table(2).blocks[0] == manager.block_table(1).blocks[0]
+        assert manager.block_table(2).blocks[1] != manager.block_table(1).blocks[1]
+
+    def test_freed_blocks_stay_cached_rather_than_going_free(self):
+        manager = self.cache_manager()
+        tokens = list(range(BLOCK_SIZE * 2))
+        manager.allocate(1, len(tokens), token_ids=tokens)
+        manager.seal(1, tokens, len(tokens))
+        manager.free(1)
+        # Still obtainable, but reclaimable rather than on the free list.
+        assert manager.prefix_cache.num_reclaimable == 2
+        assert len(manager.free_blocks) == 14
+        manager.check_invariants()
+
+    def test_a_reclaimable_block_can_still_be_reused(self):
+        manager = self.cache_manager()
+        tokens = list(range(BLOCK_SIZE * 2))
+        manager.allocate(1, len(tokens), token_ids=tokens)
+        manager.seal(1, tokens, len(tokens))
+        original = list(manager.block_table(1))
+        manager.free(1)
+        manager.allocate(2, len(tokens), token_ids=tokens)
+        assert list(manager.block_table(2)) == original
+
+    def test_pressure_reclaims_the_least_recently_used(self):
+        manager = self.cache_manager(num_blocks=4)
+        for seq_id in range(2):
+            tokens = [seq_id * 1000 + i for i in range(BLOCK_SIZE * 2)]
+            manager.allocate(seq_id, len(tokens), token_ids=tokens)
+            manager.seal(seq_id, tokens, len(tokens))
+            manager.free(seq_id)
+        assert manager.prefix_cache.num_reclaimable == 4
+
+        # A wholly new prompt must evict rather than fail.
+        fresh = [9999 + i for i in range(BLOCK_SIZE * 2)]
+        manager.allocate(9, len(fresh), token_ids=fresh)
+        assert manager.prefix_cache.stats.evictions > 0
+        manager.check_invariants()
+
+    def test_caching_off_never_reuses(self):
+        manager = BlockManager(16, BLOCK_SIZE, watermark=0.0, enable_prefix_caching=False)
+        tokens = list(range(BLOCK_SIZE * 2))
+        manager.allocate(1, len(tokens), token_ids=tokens)
+        manager.seal(1, tokens, len(tokens))
+        _, cached = manager.allocate(2, len(tokens), token_ids=tokens)
+        assert cached == 0
+        assert manager.block_table(2).blocks != manager.block_table(1).blocks

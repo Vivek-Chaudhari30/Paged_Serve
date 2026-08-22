@@ -43,10 +43,11 @@ def resolve_device(spec: str | None = None) -> torch.device:
 def resolve_dtype(spec: str | None, device: torch.device) -> torch.dtype:
     """Pick a dtype the device can actually run.
 
-    bfloat16 is the default on CUDA, but Turing (T4) and Volta (V100) have no
-    bf16 support at all, so the fp16 fallback is a correctness requirement, not
-    a preference. CPU and MPS get float32: bf16 on CPU is emulated and slow
-    enough to make a measurement meaningless.
+    Native bf16 starts at Ampere (compute capability 8.0). Turing (T4) and
+    Volta (V100) lack it, and PyTorch will happily *emulate* bf16 there — which
+    is correct and slow, and is why this checks the capability directly rather
+    than asking ``torch.cuda.is_bf16_supported()``. CPU and MPS get float32 for
+    the same reason: emulated bf16 makes a measurement meaningless.
     """
     if spec:
         dtype = getattr(torch, spec, None)
@@ -54,7 +55,15 @@ def resolve_dtype(spec: str | None, device: torch.device) -> torch.dtype:
             raise ValueError(f"not a torch dtype: {spec!r}")
         return dtype
     if device.type == "cuda":
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        # Compute capability, NOT torch.cuda.is_bf16_supported(). That returns
+        # True on a Turing T4, because recent PyTorch counts *emulated* bf16 as
+        # supported. Emulated bf16 is correct and slow, so trusting it would
+        # silently pick the wrong dtype on exactly the card most free GPU
+        # sessions hand out, and any throughput measured that way would be
+        # meaningless. Native bf16 starts at Ampere (8.0).
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        major, _ = torch.cuda.get_device_capability(index)
+        return torch.bfloat16 if major >= 8 else torch.float16
     return torch.float32
 
 
@@ -203,6 +212,10 @@ class CacheConfig:
     num_blocks_override: int | None = None
     # Host blocks for SWAP preemption. Only allocated when the policy needs it.
     swap_space_blocks: int = 512
+    # Prefix caching must be switchable, because "identical output with it
+    # on and off" is the property that makes it safe, and that is only
+    # testable if both states exist.
+    enable_prefix_caching: bool = False
 
     def __post_init__(self) -> None:
         if self.max_seq_len < 1:
@@ -218,6 +231,7 @@ class CacheConfig:
             "gpu_memory_utilization": self.gpu_memory_utilization,
             "num_blocks_override": self.num_blocks_override,
             "swap_space_blocks": self.swap_space_blocks,
+            "enable_prefix_caching": self.enable_prefix_caching,
         }
 
 

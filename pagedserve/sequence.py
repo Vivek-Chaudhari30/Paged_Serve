@@ -25,6 +25,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from pagedserve.model.sampler import SamplingParams
+
 __all__ = ["Sequence", "SequenceStatus"]
 
 
@@ -66,6 +68,7 @@ class Sequence:
     prompt_token_ids: list[int]
     max_tokens: int
     stop_token_ids: tuple[int, ...] = ()
+    sampling: SamplingParams = field(default_factory=SamplingParams)
     output_token_ids: list[int] = field(default_factory=list)
     status: SequenceStatus = SequenceStatus.WAITING
     num_computed_tokens: int = 0
@@ -118,6 +121,26 @@ class Sequence:
             self.finish_reason = "length"
             return True
         return False
+
+    def fork(self, seq_id: int) -> Sequence:
+        """A sibling starting from the same state.
+
+        For ``n>1``: the copy shares the prompt and everything generated so far,
+        and diverges from the next token onward. The KV behind it is shared by
+        the block manager rather than copied, which is why n>1 costs almost
+        nothing in memory — the payoff for building refcounts in Phase 2 rather
+        than retrofitting them.
+        """
+        return Sequence(
+            seq_id=seq_id,
+            prompt_token_ids=list(self.prompt_token_ids),
+            max_tokens=self.max_tokens,
+            stop_token_ids=self.stop_token_ids,
+            sampling=self.sampling,
+            output_token_ids=list(self.output_token_ids),
+            status=self.status,
+            num_computed_tokens=self.num_computed_tokens,
+        )
 
     def reset_for_recompute(self) -> None:
         """Drop cached state, keeping generated tokens.

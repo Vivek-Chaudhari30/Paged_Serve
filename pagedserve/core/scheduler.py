@@ -303,7 +303,7 @@ class Scheduler:
                 break
 
             self.swapped.popleft()
-            table = self.block_manager.allocate(sequence.seq_id, sequence.total_len)
+            table, _ = self.block_manager.allocate(sequence.seq_id, sequence.total_len)
             self._do_swap_in(cpu_blocks, list(table)[: len(cpu_blocks)])
             self._swapped_blocks.pop(sequence.seq_id, None)
 
@@ -353,7 +353,15 @@ class Scheduler:
                 break
 
             self.waiting.popleft()
-            self.block_manager.allocate(sequence.seq_id, sequence.total_len)
+            # Prompt tokens are handed to the allocator so it can match the
+            # prefix cache. A hit returns blocks whose KV already exists, and
+            # num_computed_tokens is how the engine learns to skip that span.
+            _, cached = self.block_manager.allocate(
+                sequence.seq_id, sequence.total_len, sequence.all_token_ids
+            )
+            if cached > sequence.num_computed_tokens:
+                sequence.num_computed_tokens = cached
+                tokens = sequence.num_uncomputed_tokens
             sequence.status = SequenceStatus.RUNNING
             self.running.append(sequence)
             budget_tokens -= tokens
