@@ -334,7 +334,11 @@ catch this — a fresh-subprocess regression test does.
 Correctness is verified on real CUDA hardware. Nothing below is a benchmark —
 a Kaggle T4 is shared and unpinnable, so its timings are not evidence (§4).
 
-- [x] Golden gate: **39/39 pass on GPU**, both backends, in float16 *and* float32
+- [x] Golden gate: **44/44 pass on GPU**, both backends, float16 and float32,
+      **prefix caching on and off** — a cache hit shortens the prefill and so
+      changes the SDPA shape, kernel, and reduction order, and the output is
+      still identical
+- [x] CUDA extension: 13/13, including the fresh-subprocess loader test
 - [x] `profile_num_blocks` measurement branch (see the known gap below)
 - [x] `SwapSpace` round-trip through genuinely pinned host memory
 - [x] Paged and contiguous produce **bit-identical logits** (max diff 0.000000)
