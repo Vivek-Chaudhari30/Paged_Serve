@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +121,11 @@ def _build_backend(
             dtype=config.dtype,
             weights_bytes=weights_bytes,
         )
-        manager = BlockManager(num_blocks, config.cache.block_size)
+        manager = BlockManager(
+            num_blocks,
+            config.cache.block_size,
+            enable_prefix_caching=config.cache.enable_prefix_caching,
+        )
         backend = PagedAttentionBackend(
             config.model,
             config.cache,
@@ -169,6 +173,7 @@ class LLMEngine:
         scheduler: SchedulerConfig | None = None,
         attn_backend: str = "gather",
         debug_invariants: bool = False,
+        enable_prefix_caching: bool | None = None,
     ) -> LLMEngine:
         """Load a checkpoint and build an engine around it.
 
@@ -177,6 +182,8 @@ class LLMEngine:
         """
         path = resolve_model_path(model)
         model_config = ModelConfig.from_pretrained(path, name=str(model))
+        if enable_prefix_caching is not None:
+            cache = replace(cache or CacheConfig(), enable_prefix_caching=enable_prefix_caching)
         config = EngineConfig.build(
             model_config,
             device=device,
@@ -558,6 +565,12 @@ class LLMEngine:
 
         for sequence, token in zip(output.scheduled, tokens, strict=True):
             sequence.num_computed_tokens = sequence.total_len
+            # Seal now, after the forward pass: a block indexed before its K and
+            # V exist would be served to another request as a hit, and that
+            # request would attend over uninitialised memory.
+            self.block_manager.seal(
+                sequence.seq_id, sequence.all_token_ids, sequence.num_computed_tokens
+            )
             sequence.append_token(token)
             sequence.check_stop()
 
@@ -694,6 +707,12 @@ class LLMEngine:
         )
         metadata = self.backend.begin_step(step)
         return self.model(input_ids, position_ids, self.backend, metadata)[0]
+
+    def prefix_cache_stats(self) -> dict[str, Any] | None:
+        """Cache hit rate and tokens saved, or None when caching is off."""
+        if self.block_manager is None or not self.block_manager.prefix_cache.enabled:
+            return None
+        return self.block_manager.prefix_cache.stats.to_dict()
 
     def config_dict(self) -> dict[str, Any]:
         """The engine config, for a benchmark result file's ``config`` block."""

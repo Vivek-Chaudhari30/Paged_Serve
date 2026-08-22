@@ -225,6 +225,14 @@ class PrefixCache:
         self._by_hash[block_hash] = block_id
         self._by_block[block_id] = block_hash
 
+    def reclaimable_blocks(self) -> list[int]:
+        """Cached blocks nobody references, in least-recently-used order."""
+        return list(self._pool)
+
+    def is_cached(self, block_id: int) -> bool:
+        """Whether this block is indexed under some prefix hash."""
+        return block_id in self._by_block
+
     def release(self, block_id: int) -> None:
         """Note that nothing references this block any more.
 

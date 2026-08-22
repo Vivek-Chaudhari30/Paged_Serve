@@ -212,6 +212,10 @@ class CacheConfig:
     num_blocks_override: int | None = None
     # Host blocks for SWAP preemption. Only allocated when the policy needs it.
     swap_space_blocks: int = 512
+    # Prefix caching must be switchable, because "identical output with it
+    # on and off" is the property that makes it safe, and that is only
+    # testable if both states exist.
+    enable_prefix_caching: bool = False
 
     def __post_init__(self) -> None:
         if self.max_seq_len < 1:
@@ -227,6 +231,7 @@ class CacheConfig:
             "gpu_memory_utilization": self.gpu_memory_utilization,
             "num_blocks_override": self.num_blocks_override,
             "swap_space_blocks": self.swap_space_blocks,
+            "enable_prefix_caching": self.enable_prefix_caching,
         }
 
 

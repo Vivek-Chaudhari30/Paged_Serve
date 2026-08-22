@@ -675,6 +675,14 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
             "preemptions": backend.engine.scheduler.num_preemptions,
         }
 
+    if hasattr(backend, "engine"):
+        stats = backend.engine.prefix_cache_stats()
+        if stats is not None:
+            # Hit rate alone is not interpretable, so tokens_saved travels with
+            # it: a hit on one block and a hit on a whole system prompt count
+            # the same and mean nothing alike.
+            workload["prefix_cache"] = stats
+
     batch_sizes = getattr(backend, "batch_sizes", None)
     if batch_sizes:
         workload["batching"] = {

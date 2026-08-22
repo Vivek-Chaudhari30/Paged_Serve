@@ -280,7 +280,29 @@ pytest                                 # on a GPU machine
 
 ## 7. Current status
 
-**Current phase: 3 — continuous batching scheduler.**
+**Current phase: 5 — block-aligned prefix caching.**
+
+Phase 5 deliverables:
+- [x] `memory/prefix_cache.py` — chained hashing, hash-to-block index, LRU pool
+- [x] Reuse on admission: walk blocks in order, bump refcounts, stop at the
+      first miss, and skip prefill for the cached span
+- [x] Copy-on-write when a sequence writes into a shared block
+- [x] LRU eviction: refcount-zero blocks stay cached until the allocator needs them
+- [x] Metrics: hit rate, tokens saved, evictions — in the result JSON
+- [ ] TTFT with and without — **needs a GPU.**
+
+Golden test passes with caching on and off, producing identical tokens.
+Measured on a shared system prompt with staggered arrivals: 78.9% block hit
+rate, 240 tokens of prefill skipped (CPU, correctness run — not a benchmark).
+
+**Reuse requires staggered arrivals.** Requests admitted in the same step
+cannot share: nothing has been through a forward pass, so there is no KV to
+reuse. A batch fired all at once shows a 0% hit rate and that is correct.
+
+**Phase 4 is partially done** — step 1 (build scaffolding) is verified on a T4;
+the decode kernel itself is not started.
+
+**Previous phase: 3 — continuous batching scheduler.**
 
 ### Phase 4 step 1 — CUDA extension scaffolding: VERIFIED on a T4
 

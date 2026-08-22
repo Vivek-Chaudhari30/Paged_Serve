@@ -64,12 +64,13 @@ class TestBlockTable:
 
 class TestAllocation:
     def test_allocates_ceil_blocks(self, manager):
-        table = manager.allocate(seq_id=1, num_tokens=5)  # 5 tokens, block 4
+        table, _ = manager.allocate(seq_id=1, num_tokens=5)  # 5 tokens, block 4
         assert len(table) == 2
         assert manager.num_free_blocks == 6
 
     def test_zero_token_sequence_takes_nothing(self, manager):
-        assert len(manager.allocate(1, 0)) == 0
+        table, _ = manager.allocate(1, 0)
+        assert len(table) == 0
         assert manager.num_free_blocks == 8
 
     def test_double_allocation_is_an_error(self, manager):
@@ -78,12 +79,12 @@ class TestAllocation:
             manager.allocate(1, 4)
 
     def test_allocating_more_than_exists_raises(self, manager):
-        with pytest.raises(MemoryError, match="need 9 blocks"):
+        with pytest.raises(MemoryError, match="need 9 more blocks"):
             manager.allocate(1, 33)
 
     def test_blocks_are_not_handed_out_twice(self, manager):
-        first = set(manager.allocate(1, 16).blocks)
-        second = set(manager.allocate(2, 16).blocks)
+        first = set(manager.allocate(1, 16)[0].blocks)
+        second = set(manager.allocate(2, 16)[0].blocks)
         assert first.isdisjoint(second)
         assert manager.num_free_blocks == 0
 
@@ -174,7 +175,7 @@ class TestFree:
 
 class TestFork:
     def test_child_shares_the_parent_blocks(self, manager):
-        parent = manager.allocate(1, 8)
+        parent, _ = manager.allocate(1, 8)
         before = manager.num_free_blocks
         child = manager.fork(1, 2)
         # Sharing costs no new blocks -- the point of refcounting.
@@ -298,7 +299,7 @@ class TestFragmentation:
         manager.free(3)
         assert manager.num_free_blocks == 6
         # A 24-token sequence still gets admitted from the scattered remainder.
-        table = manager.allocate(5, 24)
+        table, _ = manager.allocate(5, 24)
         assert len(table) == 6
         manager.check_invariants()
 

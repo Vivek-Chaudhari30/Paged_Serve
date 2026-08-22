@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import logging
 from collections import deque
+from collections.abc import Sequence
 from enum import Enum
 
 from pagedserve.memory.block import BlockTable, PhysicalBlock
+from pagedserve.memory.prefix_cache import PrefixCache, block_hashes, chain_hash
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +58,14 @@ class AllocStatus(Enum):
 class BlockManager:
     """Hands out fixed-size KV blocks and tracks who holds them."""
 
-    def __init__(self, num_blocks: int, block_size: int, *, watermark: float = 0.01) -> None:
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int,
+        *,
+        watermark: float = 0.01,
+        enable_prefix_caching: bool = False,
+    ) -> None:
         """
         Args:
             num_blocks: Physical blocks available to sequences. The cache itself
@@ -81,6 +90,16 @@ class BlockManager:
         self.free_blocks: deque[int] = deque(range(num_blocks))
         self.block_tables: dict[int, BlockTable] = {}
 
+        # Prefix caching introduces a THIRD block state. Without it a block is
+        # either on the free list or referenced by a sequence; with it, a block
+        # can be referenced by nobody and still be worth keeping, because its
+        # contents may be wanted again shortly. Those blocks live in the cache's
+        # LRU pool: not free, not referenced, reclaimable on demand.
+        self.prefix_cache = PrefixCache(block_size, enabled=enable_prefix_caching)
+        # Chained hash per full block, per sequence. Kept so that sealing a
+        # newly filled block costs one hash rather than re-hashing the sequence.
+        self._chains: dict[int, list[int]] = {}
+
     # ---- the extra block ------------------------------------------------
 
     @property
@@ -104,7 +123,14 @@ class BlockManager:
 
     @property
     def num_free_blocks(self) -> int:
-        return len(self.free_blocks)
+        """Blocks obtainable right now, reclaimable cached blocks included.
+
+        A cached block with no references is available: taking it costs an
+        eviction, not a wait. Reporting only the free list would make the
+        scheduler defer admissions it could serve, and the more effective the
+        cache became the more it would look like memory pressure.
+        """
+        return len(self.free_blocks) + self.prefix_cache.num_reclaimable
 
     @property
     def num_used_blocks(self) -> int:
@@ -131,21 +157,120 @@ class BlockManager:
             return AllocStatus.LATER
         return AllocStatus.OK
 
-    def allocate(self, seq_id: int, num_tokens: int) -> BlockTable:
-        """Give a sequence enough blocks to hold ``num_tokens``."""
+    def allocate(
+        self, seq_id: int, num_tokens: int, token_ids: Sequence[int] | None = None
+    ) -> tuple[BlockTable, int]:
+        """Give a sequence enough blocks to hold ``num_tokens``.
+
+        When ``token_ids`` is supplied and prefix caching is on, the leading
+        blocks are matched against the cache and reused rather than allocated.
+        A reused block already holds the right K and V, so the tokens it covers
+        need no forward pass at all -- which is where the time-to-first-token
+        saving comes from, since prefill is what dominates TTFT.
+
+        Returns:
+            The block table, and how many leading tokens are already computed.
+        """
         if seq_id in self.block_tables:
             raise ValueError(f"sequence {seq_id} is already allocated")
         needed = self.blocks_needed(num_tokens)
-        if needed > self.num_free_blocks:
-            raise MemoryError(
-                f"need {needed} blocks for sequence {seq_id}, {self.num_free_blocks} free"
-            )
 
         table = BlockTable(self.block_size)
-        for _ in range(needed):
+        chain: list[int] = []
+        cached_tokens = 0
+
+        if token_ids is not None and self.prefix_cache.enabled:
+            for block_hash in block_hashes(token_ids, self.block_size)[:needed]:
+                block_id = self.prefix_cache.lookup(block_hash)
+                if block_id is None:
+                    break
+                # The refcount is what stops a reused block being reclaimed out
+                # from under us; the cache index does not own it.
+                self.blocks[block_id].ref_count += 1
+                self._discard_free(block_id)
+                table.append(block_id)
+                chain.append(block_hash)
+                cached_tokens += self.block_size
+            if cached_tokens:
+                self.prefix_cache.stats.blocks_reused += len(table)
+                self.prefix_cache.stats.tokens_saved += cached_tokens
+
+        # A fully cached prompt would leave nothing to run, and a forward pass
+        # over zero tokens produces no logits to sample from. Hold one token
+        # back so there is always work to do.
+        cached_tokens = min(cached_tokens, max(0, num_tokens - 1))
+
+        remaining = needed - len(table)
+        if remaining > self.num_free_blocks:
+            for block_id in table:
+                self.blocks[block_id].ref_count -= 1
+            raise MemoryError(
+                f"need {remaining} more blocks for sequence {seq_id}, "
+                f"{self.num_free_blocks} available"
+            )
+        for _ in range(remaining):
             table.append(self._take_free_block())
+
         self.block_tables[seq_id] = table
-        return table
+        self._chains[seq_id] = chain
+        return table, cached_tokens
+
+    def _discard_free(self, block_id: int) -> None:
+        """Take a block off the free list if it happens to be there.
+
+        A cache hit can land on a block that was never released into the pool
+        but is sitting on the free list; handing it out twice would corrupt
+        both holders.
+        """
+        if block_id in self.free_blocks:
+            self.free_blocks.remove(block_id)
+
+    def seal(self, seq_id: int, token_ids: Sequence[int], num_computed: int) -> None:
+        """Index blocks whose KV is now computed and whose block is full.
+
+        Sealing happens *after* the forward pass, never at allocation. A block
+        indexed before its K and V exist would be served to another request as
+        a cache hit, and that request would attend over uninitialised memory and
+        generate fluent nonsense. The tokens are known early; the KV is not.
+        """
+        if not self.prefix_cache.enabled:
+            return
+        table = self.block_tables.get(seq_id)
+        if table is None:
+            return
+        chain = self._chains.setdefault(seq_id, [])
+        complete = min(num_computed, len(token_ids)) // self.block_size
+        while len(chain) < min(complete, len(table)):
+            index = len(chain)
+            parent = chain[-1] if chain else None
+            start = index * self.block_size
+            block_hash = chain_hash(parent, token_ids[start : start + self.block_size])
+            chain.append(block_hash)
+            self.prefix_cache.insert(block_hash, table.blocks[index])
+
+    def copy_on_write(self, seq_id: int, logical_block: int) -> tuple[int, int] | None:
+        """Give a sequence a private copy of a block it shares with someone else.
+
+        Returns ``(source, destination)`` for the caller to copy in the KV
+        cache, or ``None`` when the block is already exclusive.
+
+        Only full blocks are ever cached and a full block is never written to
+        again, so prefix caching alone never triggers this. Forking does: n>1
+        sampling shares a partially filled block between samples that then
+        diverge, and without the copy the second writer would overwrite the
+        first one's tokens in place.
+        """
+        table = self._table(seq_id)
+        source = table.blocks[logical_block]
+        if self.blocks[source].ref_count <= 1:
+            return None
+        destination = self._take_free_block()
+        table.blocks[logical_block] = destination
+        self.blocks[source].ref_count -= 1
+        # The copy is about to diverge from the prefix its hash identifies, so
+        # it must not be reachable as a cache hit.
+        self.prefix_cache.forget(destination)
+        return source, destination
 
     def append_slot(self, seq_id: int, new_length: int) -> int | None:
         """Extend a sequence to ``new_length`` tokens, growing it if needed.
@@ -176,6 +301,7 @@ class BlockManager:
         double-free into a crashed benchmark.
         """
         table = self.block_tables.pop(seq_id, None)
+        self._chains.pop(seq_id, None)
         if table is None:
             return
         for block_id in table:
@@ -186,7 +312,13 @@ class BlockManager:
                     f"block {block_id} refcount went negative freeing sequence {seq_id}"
                 )
             if block.ref_count == 0:
-                self.free_blocks.append(block_id)
+                if self.prefix_cache.is_cached(block_id):
+                    # Keep it warm rather than reclaiming it. A finished
+                    # request's system-prompt blocks are the most likely blocks
+                    # to be wanted a second later.
+                    self.prefix_cache.release(block_id)
+                else:
+                    self.free_blocks.append(block_id)
 
     def fork(self, parent_id: int, child_id: int) -> BlockTable:
         """Share a parent's blocks with a child, copy-on-write.
@@ -220,6 +352,15 @@ class BlockManager:
         return table
 
     def _take_free_block(self) -> int:
+        if not self.free_blocks:
+            # Nothing free, but a cached block nobody references can be
+            # reclaimed. This is the "under memory pressure" half of the LRU
+            # pool: the cache holds blocks until the allocator actually needs
+            # them, and not one step longer.
+            evicted = self.prefix_cache.evict()
+            if evicted is None:
+                raise MemoryError("no free blocks and nothing reclaimable")
+            self.free_blocks.append(evicted)
         block_id = self.free_blocks.popleft()
         block = self.blocks[block_id]
         if block.ref_count != 0:
@@ -257,10 +398,20 @@ class BlockManager:
                 )
 
         allocated = set(held)
-        if len(free) + len(allocated) != self.num_blocks:
+        # Prefix caching adds a third state: cached, unreferenced, reclaimable.
+        # Such a block is deliberately on neither the free list nor any block
+        # table, so the two-way partition no longer holds and asserting it would
+        # report a leak every time the cache did its job.
+        reclaimable = set(self.prefix_cache.reclaimable_blocks()) - allocated
+        total = len(free) + len(allocated) + len(reclaimable)
+        if total != self.num_blocks:
             raise AssertionError(
-                f"free ({len(free)}) + allocated ({len(allocated)}) != "
-                f"num_blocks ({self.num_blocks})"
+                f"free ({len(free)}) + allocated ({len(allocated)}) + "
+                f"reclaimable ({len(reclaimable)}) != num_blocks ({self.num_blocks})"
+            )
+        if free & reclaimable:
+            raise AssertionError(
+                f"blocks are both free and reclaimable: {sorted(free & reclaimable)}"
             )
         if free & allocated:
             raise AssertionError(f"blocks are both free and allocated: {sorted(free & allocated)}")
@@ -294,8 +445,10 @@ class BlockManager:
                     )
 
     def reset(self) -> None:
-        """Return every block to the free list."""
+        """Return every block to the free list and empty the cache."""
         self.block_tables.clear()
+        self._chains.clear()
+        self.prefix_cache.reset()
         for block in self.blocks:
             block.ref_count = 0
         self.free_blocks = deque(range(self.num_blocks))
