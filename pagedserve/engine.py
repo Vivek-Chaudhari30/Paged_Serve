@@ -39,7 +39,7 @@ from pagedserve.core.scheduler import Scheduler, SchedulerOutput
 from pagedserve.memory.block_manager import AllocStatus, BlockManager
 from pagedserve.model.llama import CausalLM
 from pagedserve.model.loader import load_state_dict, resolve_model_path
-from pagedserve.model.sampler import greedy
+from pagedserve.model.sampler import SamplingParams, SamplingTensors, greedy, sample
 from pagedserve.sequence import Sequence
 from pagedserve.worker.cache_engine import SwapSpace, profile_num_blocks
 
@@ -157,6 +157,7 @@ class LLMEngine:
         self.block_manager = block_manager
         self.scheduler: Scheduler | None = None
         self._next_seq_id = 0
+        self._generator: torch.Generator | None = None
 
     @property
     def is_paged(self) -> bool:
@@ -515,6 +516,7 @@ class LLMEngine:
         *,
         stop_token_ids: tuple[int, ...] | None = None,
         seq_id: int | None = None,
+        sampling: SamplingParams | None = None,
     ) -> Sequence:
         """Enqueue a request. It joins the batch on some later iteration."""
         if self.scheduler is None:
@@ -529,9 +531,17 @@ class LLMEngine:
             stop_token_ids=(
                 stop_token_ids if stop_token_ids is not None else self.config.model.eos_token_ids
             ),
+            sampling=sampling or SamplingParams(max_tokens=max_tokens),
         )
         self.scheduler.add_request(sequence)
         return sequence
+
+    def seed(self, seed: int | None) -> None:
+        """Fix the sampling stream, so a sampled run is reproducible."""
+        if seed is None:
+            self._generator = None
+            return
+        self._generator = torch.Generator(device=self.config.device).manual_seed(seed)
 
     @torch.inference_mode()
     def step(self) -> SchedulerOutput:
@@ -561,7 +571,16 @@ class LLMEngine:
             metadata,
             logits_indices=batch.logits_indices,
         )
-        tokens = greedy(logits).tolist()
+        # Per-row parameters, staged once per step. An all-greedy batch short
+        # circuits to argmax inside sample(), so the path five phases of golden
+        # tests verified is untouched.
+        sampling = SamplingTensors.build(
+            [s.sampling for s in output.scheduled],
+            [s.all_token_ids for s in output.scheduled],
+            device=self.config.device,
+            dtype=torch.float32,
+        )
+        tokens = sample(logits, sampling, generator=self._generator).tolist()
 
         for sequence, token in zip(output.scheduled, tokens, strict=True):
             sequence.num_computed_tokens = sequence.total_len
