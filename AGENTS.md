@@ -282,6 +282,28 @@ pytest                                 # on a GPU machine
 
 **Current phase: 3 — continuous batching scheduler.**
 
+### Phase 4 step 1 — CUDA extension scaffolding: VERIFIED on a T4
+
+- [x] `nvcc` compiles `csrc/trivial.cu`; links `pagedserve._C` against libtorch
+- [x] Architecture inferred as `sm_75` from the visible GPU — `setup.py`
+      deliberately passes no `-arch`, since a hardcoded one yields a binary that
+      will not load on any other card
+- [x] Build canary passes: round-trip, non-contiguous input, empty tensor,
+      1M elements, CPU rejection, dtype rejection, no input mutation
+- [x] `importable: True` from a fresh process with torch not previously imported
+
+Build it explicitly, never via `pip install` — pip builds in an isolated
+environment with no torch, so the extension silently would not build:
+
+```bash
+python setup.py build_ext --inplace
+```
+
+**`extension.py` must import torch before `pagedserve._C`.** The extension links
+against libc10/libtorch, which live in torch's package directory rather than on
+the loader's search path. pytest imports torch first, so a test suite cannot
+catch this — a fresh-subprocess regression test does.
+
 ### GPU verification status (Tesla T4, sm_75, torch 2.10+cu128, float16)
 
 Correctness is verified on real CUDA hardware. Nothing below is a benchmark —
