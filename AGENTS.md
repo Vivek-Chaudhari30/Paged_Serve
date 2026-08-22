@@ -286,7 +286,10 @@ Phase 5 deliverables:
 - [x] `memory/prefix_cache.py` — chained hashing, hash-to-block index, LRU pool
 - [x] Reuse on admission: walk blocks in order, bump refcounts, stop at the
       first miss, and skip prefill for the cached span
-- [x] Copy-on-write when a sequence writes into a shared block
+- [x] Copy-on-write when a sequence writes into a shared block — implemented
+      and tested, but **not reachable from prefix caching alone**: only full
+      blocks are cached and a full block is never written to again. It is for
+      `fork()` in Phase 6.
 - [x] LRU eviction: refcount-zero blocks stay cached until the allocator needs them
 - [x] Metrics: hit rate, tokens saved, evictions — in the result JSON
 - [ ] TTFT with and without — **needs a GPU.**
