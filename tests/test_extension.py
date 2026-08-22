@@ -61,6 +61,41 @@ class TestOptionalImport:
             # An error that does not say what to do next is a dead end.
             assert "build_ext" in reason
 
+    def test_loads_without_torch_already_imported(self):
+        """The extension must not depend on someone else importing torch first.
+
+        It links against libc10 and libtorch, which live in torch's package
+        directory rather than on the loader's default search path. A caller that
+        has already imported torch resolves them by accident; a fresh process
+        that has not gets "libc10.so: cannot open shared object file" and a
+        perfectly good build looks broken. A test suite hides this, because
+        importing torch is the first thing most test modules do.
+        """
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                # Distinct tokens, not AVAILABLE/UNAVAILABLE: the second
+                # contains the first as a substring.
+                "from pagedserve.extension import is_available;"
+                "print('EXT=YES' if is_available() else 'EXT=NO')",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        verdict = "EXT=YES" in result.stdout
+        # In a fresh process the answer must match this one. Whether the
+        # extension exists is environment-dependent; agreeing is not.
+        assert verdict == extension.is_available(), (
+            f"a fresh process disagrees about the extension.\n"
+            f"  here: {extension.is_available()}\n"
+            f"  fresh: {result.stdout.strip()}\n{result.stderr[-500:]}"
+        )
+
     def test_repeated_calls_are_cached(self):
         first = extension.load()
         second = extension.load()

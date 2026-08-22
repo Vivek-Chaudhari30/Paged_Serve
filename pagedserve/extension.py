@@ -38,6 +38,28 @@ def load() -> Any | None:
 
     _attempted = True
     try:
+        # torch MUST be imported first. The extension links against libc10,
+        # libtorch and libtorch_cuda, and those live in torch's package
+        # directory rather than anywhere the dynamic loader searches by default.
+        # Importing torch loads them into the process, after which the
+        # extension resolves. Without it the import fails with
+        # "libc10.so: cannot open shared object file" -- which reads like a
+        # broken build even though the build was perfectly fine, and which only
+        # appears when nothing else in the process happened to import torch
+        # first. That makes it exactly the kind of bug that hides in a test
+        # suite and surfaces in a script.
+        import torch  # noqa: F401
+    except ImportError as exc:
+        _reason = (
+            f"torch is not installed ({exc}), so the CUDA extension cannot be "
+            f"loaded. Install the [engine] extra."
+        )
+        _extension = None
+        _warned = True
+        logger.warning("CUDA extension unavailable: %s", _reason)
+        return None
+
+    try:
         import pagedserve._C as extension  # type: ignore[import-not-found]
     except ImportError as exc:
         _reason = (
