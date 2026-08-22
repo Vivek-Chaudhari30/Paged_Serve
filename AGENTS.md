@@ -280,7 +280,29 @@ pytest                                 # on a GPU machine
 
 ## 7. Current status
 
-**Current phase: 5 — block-aligned prefix caching.**
+**Current phase: 6 — FastAPI server.**
+
+Phase 6 deliverables:
+- [x] OpenAI-compatible `/v1/completions` and `/v1/chat/completions`
+- [x] SSE streaming, per-request `asyncio.Queue` fed by a background engine loop
+- [x] Full sampling: temperature, top-p, top-k, repetition penalty, stop strings
+- [x] `n>1` via block-table forking
+- [x] Client disconnect frees blocks immediately, verified by the free-block count
+- [ ] Full sweep through the HTTP path — **needs a GPU.**
+
+```bash
+python -m pagedserve.server --model Qwen/Qwen2.5-0.5B-Instruct --num-blocks 512
+```
+
+**Greedy is unchanged.** An all-greedy batch short-circuits to `argmax` and
+never touches softmax or multinomial — five phases of golden tests depend on it
+being bit-for-bit stable. Golden still passes 44/44.
+
+**Stop strings live in the server, not the engine.** Detecting them needs a
+detokenizer and AGENTS.md §2.5 keeps the tokenizer out of the hot loop. The
+engine handles stop *tokens*, which need no decoding.
+
+**Previous phase: 5 — block-aligned prefix caching.**
 
 Phase 5 deliverables:
 - [x] `memory/prefix_cache.py` — chained hashing, hash-to-block index, LRU pool
