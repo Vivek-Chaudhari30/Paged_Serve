@@ -280,7 +280,102 @@ pytest                                 # on a GPU machine
 
 ## 7. Current status
 
-**Current phase: 3 — continuous batching scheduler.**
+**Current phase: 6 — FastAPI server.**
+
+Phase 6 deliverables:
+- [x] OpenAI-compatible `/v1/completions` and `/v1/chat/completions`
+- [x] SSE streaming, per-request `asyncio.Queue` fed by a background engine loop
+- [x] Full sampling: temperature, top-p, top-k, repetition penalty, stop strings
+- [x] `n>1` via block-table forking
+- [x] Client disconnect frees blocks immediately, verified by the free-block count
+- [ ] Full sweep through the HTTP path — **needs a GPU.**
+
+```bash
+python -m pagedserve.server --model Qwen/Qwen2.5-0.5B-Instruct --num-blocks 512
+```
+
+**Greedy is unchanged.** An all-greedy batch short-circuits to `argmax` and
+never touches softmax or multinomial — five phases of golden tests depend on it
+being bit-for-bit stable. Golden still passes 44/44.
+
+**Stop strings live in the server, not the engine.** Detecting them needs a
+detokenizer and AGENTS.md §2.5 keeps the tokenizer out of the hot loop. The
+engine handles stop *tokens*, which need no decoding.
+
+**Previous phase: 5 — block-aligned prefix caching.**
+
+Phase 5 deliverables:
+- [x] `memory/prefix_cache.py` — chained hashing, hash-to-block index, LRU pool
+- [x] Reuse on admission: walk blocks in order, bump refcounts, stop at the
+      first miss, and skip prefill for the cached span
+- [x] Copy-on-write when a sequence writes into a shared block — implemented
+      and tested, but **not reachable from prefix caching alone**: only full
+      blocks are cached and a full block is never written to again. It is for
+      `fork()` in Phase 6.
+- [x] LRU eviction: refcount-zero blocks stay cached until the allocator needs them
+- [x] Metrics: hit rate, tokens saved, evictions — in the result JSON
+- [ ] TTFT with and without — **needs a GPU.**
+
+Golden test passes with caching on and off, producing identical tokens.
+Measured on a shared system prompt with staggered arrivals: 78.9% block hit
+rate, 240 tokens of prefill skipped (CPU, correctness run — not a benchmark).
+
+**Reuse requires staggered arrivals.** Requests admitted in the same step
+cannot share: nothing has been through a forward pass, so there is no KV to
+reuse. A batch fired all at once shows a 0% hit rate and that is correct.
+
+**Phase 4 is partially done** — step 1 (build scaffolding) is verified on a T4;
+the decode kernel itself is not started.
+
+**Previous phase: 3 — continuous batching scheduler.**
+
+### Phase 4 step 1 — CUDA extension scaffolding: VERIFIED on a T4
+
+- [x] `nvcc` compiles `csrc/trivial.cu`; links `pagedserve._C` against libtorch
+- [x] Architecture inferred as `sm_75` from the visible GPU — `setup.py`
+      deliberately passes no `-arch`, since a hardcoded one yields a binary that
+      will not load on any other card
+- [x] Build canary passes: round-trip, non-contiguous input, empty tensor,
+      1M elements, CPU rejection, dtype rejection, no input mutation
+- [x] `importable: True` from a fresh process with torch not previously imported
+
+Build it explicitly, never via `pip install` — pip builds in an isolated
+environment with no torch, so the extension silently would not build:
+
+```bash
+python setup.py build_ext --inplace
+```
+
+**`extension.py` must import torch before `pagedserve._C`.** The extension links
+against libc10/libtorch, which live in torch's package directory rather than on
+the loader's search path. pytest imports torch first, so a test suite cannot
+catch this — a fresh-subprocess regression test does.
+
+### GPU verification status (Tesla T4, sm_75, torch 2.10+cu128, float16)
+
+Correctness is verified on real CUDA hardware. Nothing below is a benchmark —
+a Kaggle T4 is shared and unpinnable, so its timings are not evidence (§4).
+
+- [x] Golden gate: **44/44 pass on GPU**, both backends, float16 and float32,
+      **prefix caching on and off** — a cache hit shortens the prefill and so
+      changes the SDPA shape, kernel, and reduction order, and the output is
+      still identical
+- [x] CUDA extension: 13/13, including the fresh-subprocess loader test
+- [x] `profile_num_blocks` measurement branch (see the known gap below)
+- [x] `SwapSpace` round-trip through genuinely pinned host memory
+- [x] Paged and contiguous produce **bit-identical logits** (max diff 0.000000)
+- [x] Forced preemption invisible in the output, both policies
+- [x] Every configuration deterministic across repeated runs
+
+**Do not run on emulated bfloat16.** Turing has no native bf16, and
+`torch.cuda.is_bf16_supported()` returns True there anyway because it counts
+emulation. `resolve_dtype` picks by compute capability instead; anything that
+selects a dtype must ask it rather than reimplement the check.
+
+**Known gap:** `profile_num_blocks` runs no profiling forward pass, so
+activation memory counts as zero and the block count is optimistic — it handed
+13.1 GB of a 14.6 GiB card to KV. Pass `--num-blocks` explicitly for any run
+that must not OOM. A two-pass profile is the real fix.
 
 Phase 3 deliverables:
 - [x] `core/scheduler.py` — waiting/running/swapped queues, `schedule()` every
@@ -294,6 +389,22 @@ Phase 3 deliverables:
 - [x] Forced-preemption tests for BOTH policies: resumed sequences produce
       output identical to an unpreempted run
 - [ ] Full concurrency sweep committed to `results/` — **needs a GPU.**
+
+The engine is now benchmarkable through the Phase 0 harness. Three ablation
+arms, one command each — the moment a GPU is available these produce committable
+result JSON:
+
+| Arm | Flag | Isolates |
+|---|---|---|
+| contiguous + static | `--no-paging` | the naive floor |
+| paged + static | `--static-batching` | paging alone |
+| paged + continuous | (default) | iteration-level scheduling |
+
+```bash
+python bench/loadgen.py --backend pagedserve --model Qwen/Qwen2.5-0.5B-Instruct \
+    --mode closed --concurrency 32 --num-requests 256 --max-tokens 128 \
+    --output results/<run>.json
+```
 
 Continuous batching output is token-identical to static batching, and stays
 identical under forced preemption with either policy.

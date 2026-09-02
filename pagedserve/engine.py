@@ -23,7 +23,8 @@ Phase 3 replaces ``generate()`` with an iteration-level ``step()``. The name
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -38,7 +39,7 @@ from pagedserve.core.scheduler import Scheduler, SchedulerOutput
 from pagedserve.memory.block_manager import AllocStatus, BlockManager
 from pagedserve.model.llama import CausalLM
 from pagedserve.model.loader import load_state_dict, resolve_model_path
-from pagedserve.model.sampler import greedy
+from pagedserve.model.sampler import SamplingParams, SamplingTensors, greedy, sample
 from pagedserve.sequence import Sequence
 from pagedserve.worker.cache_engine import SwapSpace, profile_num_blocks
 
@@ -120,7 +121,11 @@ def _build_backend(
             dtype=config.dtype,
             weights_bytes=weights_bytes,
         )
-        manager = BlockManager(num_blocks, config.cache.block_size)
+        manager = BlockManager(
+            num_blocks,
+            config.cache.block_size,
+            enable_prefix_caching=config.cache.enable_prefix_caching,
+        )
         backend = PagedAttentionBackend(
             config.model,
             config.cache,
@@ -152,6 +157,7 @@ class LLMEngine:
         self.block_manager = block_manager
         self.scheduler: Scheduler | None = None
         self._next_seq_id = 0
+        self._generator: torch.Generator | None = None
 
     @property
     def is_paged(self) -> bool:
@@ -168,6 +174,7 @@ class LLMEngine:
         scheduler: SchedulerConfig | None = None,
         attn_backend: str = "gather",
         debug_invariants: bool = False,
+        enable_prefix_caching: bool | None = None,
     ) -> LLMEngine:
         """Load a checkpoint and build an engine around it.
 
@@ -176,6 +183,8 @@ class LLMEngine:
         """
         path = resolve_model_path(model)
         model_config = ModelConfig.from_pretrained(path, name=str(model))
+        if enable_prefix_caching is not None:
+            cache = replace(cache or CacheConfig(), enable_prefix_caching=enable_prefix_caching)
         config = EngineConfig.build(
             model_config,
             device=device,
@@ -201,6 +210,7 @@ class LLMEngine:
         max_tokens: int,
         *,
         eos_token_ids: tuple[int, ...] | None = None,
+        on_step: Callable[[list[int | None]], None] | None = None,
     ) -> GenerationOutput:
         """Generate greedily for a whole batch at once, left-padded.
 
@@ -208,6 +218,11 @@ class LLMEngine:
             prompt_token_ids: One list of token ids per request.
             max_tokens: Cap on generated tokens per request.
             eos_token_ids: Stop tokens. Defaults to the checkpoint's.
+            on_step: Called after each decode step with one entry per sequence:
+                the token just produced, or ``None`` for a sequence that has
+                already finished. Exists so a benchmark can observe tokens as
+                they appear — returning everything at the end would report a
+                TTFT equal to E2E for every request and erase the metric.
 
         Returns:
             Generated ids per request, why each stopped, and the per-step KV
@@ -283,6 +298,7 @@ class LLMEngine:
         for offset in range(max_tokens):
             position = max_prompt + offset
             token_list = next_tokens.tolist()
+            before_finished = list(finished)
             for i, token in enumerate(token_list):
                 if finished[i]:
                     continue
@@ -292,6 +308,14 @@ class LLMEngine:
                     finish_reasons[i] = "stop"
                 elif len(outputs[i]) >= max_tokens:
                     finished[i] = True
+
+            if on_step is not None:
+                on_step(
+                    [
+                        None if was_finished else token_list[i]
+                        for i, was_finished in enumerate(before_finished)
+                    ]
+                )
 
             if all(finished):
                 break
@@ -492,6 +516,7 @@ class LLMEngine:
         *,
         stop_token_ids: tuple[int, ...] | None = None,
         seq_id: int | None = None,
+        sampling: SamplingParams | None = None,
     ) -> Sequence:
         """Enqueue a request. It joins the batch on some later iteration."""
         if self.scheduler is None:
@@ -506,9 +531,17 @@ class LLMEngine:
             stop_token_ids=(
                 stop_token_ids if stop_token_ids is not None else self.config.model.eos_token_ids
             ),
+            sampling=sampling or SamplingParams(max_tokens=max_tokens),
         )
         self.scheduler.add_request(sequence)
         return sequence
+
+    def seed(self, seed: int | None) -> None:
+        """Fix the sampling stream, so a sampled run is reproducible."""
+        if seed is None:
+            self._generator = None
+            return
+        self._generator = torch.Generator(device=self.config.device).manual_seed(seed)
 
     @torch.inference_mode()
     def step(self) -> SchedulerOutput:
@@ -538,10 +571,25 @@ class LLMEngine:
             metadata,
             logits_indices=batch.logits_indices,
         )
-        tokens = greedy(logits).tolist()
+        # Per-row parameters, staged once per step. An all-greedy batch short
+        # circuits to argmax inside sample(), so the path five phases of golden
+        # tests verified is untouched.
+        sampling = SamplingTensors.build(
+            [s.sampling for s in output.scheduled],
+            [s.all_token_ids for s in output.scheduled],
+            device=self.config.device,
+            dtype=torch.float32,
+        )
+        tokens = sample(logits, sampling, generator=self._generator).tolist()
 
         for sequence, token in zip(output.scheduled, tokens, strict=True):
             sequence.num_computed_tokens = sequence.total_len
+            # Seal now, after the forward pass: a block indexed before its K and
+            # V exist would be served to another request as a hit, and that
+            # request would attend over uninitialised memory.
+            self.block_manager.seal(
+                sequence.seq_id, sequence.all_token_ids, sequence.num_computed_tokens
+            )
             sequence.append_token(token)
             sequence.check_stop()
 
@@ -646,6 +694,44 @@ class LLMEngine:
                 used_blocks=manager.num_used_blocks,
             ),
         )
+
+    @torch.inference_mode()
+    def logits_for(self, token_ids: list[int]) -> torch.Tensor:
+        """Logits for the next token after ``token_ids``, one prefill pass.
+
+        A diagnostic hook, not part of generation. Comparing raw logits between
+        two backends at a contested step is what separates "these implementations
+        disagree" from "these implementations agree and float16 rounded the
+        argmax differently".
+        """
+        device = self.config.device
+        length = len(token_ids)
+        self.backend.allocate()
+        if self.block_manager is not None:
+            self.block_manager.reset()
+            self.block_manager.allocate(0, length)
+
+        input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+        position_ids = torch.arange(length, device=device).unsqueeze(0)
+        padding_mask = torch.ones((1, length), dtype=torch.bool, device=device)
+        step = self._build_step(
+            query_len=length,
+            context_len=0,
+            seq_lens=torch.tensor([length], dtype=torch.int32, device=device),
+            padding_mask=padding_mask,
+            query_positions=position_ids,
+            is_prefill=True,
+            token_is_real=padding_mask,
+            logical_starts=[0],
+        )
+        metadata = self.backend.begin_step(step)
+        return self.model(input_ids, position_ids, self.backend, metadata)[0]
+
+    def prefix_cache_stats(self) -> dict[str, Any] | None:
+        """Cache hit rate and tokens saved, or None when caching is off."""
+        if self.block_manager is None or not self.block_manager.prefix_cache.enabled:
+            return None
+        return self.block_manager.prefix_cache.stats.to_dict()
 
     def config_dict(self) -> dict[str, Any]:
         """The engine config, for a benchmark result file's ``config`` block."""

@@ -52,13 +52,39 @@ python --version
 
 echo "==> checkout"
 if [ -d "${CHECKOUT}/.git" ]; then
-    git -C "${CHECKOUT}" fetch --depth 1 origin "${REPO_BRANCH}"
-    git -C "${CHECKOUT}" checkout -f "${REPO_BRANCH}"
-    git -C "${CHECKOUT}" reset --hard "origin/${REPO_BRANCH}"
+    # An explicit refspec is required. A shallow clone made with --branch main
+    # configures a refspec for main ALONE, so `fetch origin <other-branch>`
+    # lands in FETCH_HEAD and creates no ref to check out -- the checkout then
+    # fails with a bare "pathspec did not match", which reads like a typo
+    # rather than a missing ref.
+    git -C "${CHECKOUT}" fetch --depth 1 origin \
+        "+refs/heads/${REPO_BRANCH}:refs/remotes/origin/${REPO_BRANCH}"
+    git -C "${CHECKOUT}" checkout -f -B "${REPO_BRANCH}" \
+        "refs/remotes/origin/${REPO_BRANCH}"
+    git -C "${CHECKOUT}" reset --hard "refs/remotes/origin/${REPO_BRANCH}"
+    git -C "${CHECKOUT}" clean -fd
 else
     git clone --depth 1 --branch "${REPO_BRANCH}" "${REPO_URL}" "${CHECKOUT}"
 fi
 cd "${CHECKOUT}"
+echo "checked out $(git rev-parse --abbrev-ref HEAD) at $(git rev-parse --short HEAD)"
+
+# A bootstrap fetched from one branch but cloning another is silent and
+# expensive: the run looks healthy while testing entirely different code.
+if [ ! -f scripts/gpu_smoke.py ]; then
+    cat >&2 <<WRONGBRANCH
+
+ERROR: this checkout has no scripts/gpu_smoke.py, so REPO_BRANCH=${REPO_BRANCH}
+does not contain the code you meant to test. Everything below would have
+exercised a different commit and reported healthy.
+
+Re-run with the branch set explicitly, e.g.
+
+    REPO_BRANCH=phase-3/continuous-batching bash <(curl -sSL <raw-url>)
+
+WRONGBRANCH
+    exit 1
+fi
 
 echo "==> install"
 # torch is preinstalled in these images and reinstalling it is a slow way to
@@ -71,10 +97,46 @@ import torch
 print("torch     ", torch.__version__)
 print("cuda      ", torch.version.cuda)
 print("gpu       ", torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)
-print("bf16      ", torch.cuda.is_bf16_supported() if torch.cuda.is_available() else False)
+if torch.cuda.is_available():
+    cap = torch.cuda.get_device_capability(0)
+    print("compute   ", f"{cap[0]}.{cap[1]}")
+    # Native bf16 starts at Ampere. is_bf16_supported() counts emulation and
+    # returns True on a T4, which is correct and slow.
+    print("bf16 native", cap[0] >= 8)
+    print("bf16 reported", torch.cuda.is_bf16_supported())
 PY
 python -c "import pagedserve; print('pagedserve', pagedserve.__version__)"
+python -c "import transformers; print('transformers', transformers.__version__)"
 pytest -q -m "not gpu"
+
+echo "==> build the CUDA extension"
+# An explicit step, not part of pip install: pip builds in an isolated
+# environment with no torch, so the extension would silently not build there
+# and the failure would surface later as an unexplained fallback.
+python setup.py build_ext --inplace 2>&1 | tail -20 \
+    || echo "CUDA BUILD FAILED - see above"
+python -c "
+from pagedserve.extension import is_available, unavailable_reason
+print('extension importable:', is_available())
+if not is_available():
+    print('reason:', unavailable_reason())"
+pytest tests/test_extension.py -q -m cuda_ext || echo "EXTENSION TESTS FAILED"
+
+echo "==> GPU smoke checks (the CUDA paths that have never run)"
+python scripts/gpu_smoke.py || echo "SOME GPU CHECKS FAILED - see above, this is the useful output"
+
+echo "==> golden test on GPU, in this device's native dtype"
+# Ask the engine which dtype it would actually use, rather than reimplementing
+# the check here. Reimplementing it is how this script ran the gate in EMULATED
+# bfloat16 on a Turing card while the library had already been fixed to choose
+# float16 -- and then reported the resulting argmax flips as a golden failure.
+GOLDEN_DTYPE=$(python -c "
+from pagedserve.config import resolve_device, resolve_dtype
+d = resolve_device(None)
+print(str(resolve_dtype(None, d)).removeprefix('torch.'))")
+echo "    using dtype ${GOLDEN_DTYPE}"
+PAGEDSERVE_TEST_DEVICE=cuda PAGEDSERVE_TEST_DTYPE="${GOLDEN_DTYPE}" \
+    pytest tests/test_golden.py -q || echo "GOLDEN TEST FAILED ON GPU - this is a bug report"
 
 echo "==> smoke run (mock backend, proves the harness works here)"
 python bench/loadgen.py --backend mock --mode closed --concurrency 8 \

@@ -8,7 +8,7 @@ version = "0.0.0"
 description = "A from-scratch high-throughput LLM inference server: paged KV cache, continuous batching, custom CUDA paged attention."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Vivek" }]
 
 # Base install is deliberately light: the benchmark harness (bench/metrics.py,
@@ -48,9 +48,11 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Benchmark drivers and bootstrap scripts are CLIs; stdout is their interface.
+# Benchmark drivers, bootstrap scripts, and the build script are CLIs; stdout
+# is their interface, and a build that reports nothing is a build you debug blind.
 "bench/*" = ["T20"]
 "scripts/*" = ["T20"]
+"setup.py" = ["T20"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

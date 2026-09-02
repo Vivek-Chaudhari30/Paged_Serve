@@ -39,7 +39,7 @@ import random
 import socket
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -57,6 +57,7 @@ __all__ = [
     "poisson_offsets",
     "run_closed_loop",
     "run_open_loop",
+    "tokenize_prompts",
     "write_result",
 ]
 
@@ -72,12 +73,18 @@ class PromptRequest:
             was available to count it. Left as ``None`` rather than estimated —
             a guessed token count would flow straight into a reported
             prompt-throughput number.
+        prompt_token_ids: The tokenized prompt, when a tokenizer was available.
+            Filled by ``tokenize_prompts`` before the run rather than inside a
+            backend: tokenizing on the measured path would charge the engine for
+            work the HuggingFace baseline is not charged for, and AGENTS.md §2.5
+            keeps the tokenizer out of the hot loop on both sides.
         request_id: Stable identifier, useful when correlating with server logs.
     """
 
     prompt: str
     max_tokens: int
     prompt_tokens: int | None = None
+    prompt_token_ids: tuple[int, ...] | None = None
     request_id: str = ""
 
 
@@ -119,6 +126,31 @@ class MockBackend:
                 yield f"t{i}"
         finally:
             self.in_flight -= 1
+
+
+def tokenize_prompts(prompts: Sequence[PromptRequest], tokenizer: Any) -> list[PromptRequest]:
+    """Fill in token ids and prompt lengths ahead of the run.
+
+    The dataset loader leaves both unknown rather than estimating them. This is
+    where they become known, which is what makes prompt throughput reportable
+    and what lets a backend that speaks token ids be driven at all.
+
+    Duck-typed on ``tokenizer(text).input_ids`` so it works with any tokenizer
+    without importing transformers here.
+    """
+    out: list[PromptRequest] = []
+    for prompt in prompts:
+        ids = tuple(tokenizer(prompt.prompt).input_ids)
+        out.append(
+            PromptRequest(
+                prompt=prompt.prompt,
+                max_tokens=prompt.max_tokens,
+                prompt_tokens=len(ids),
+                prompt_token_ids=ids,
+                request_id=prompt.request_id,
+            )
+        )
+    return out
 
 
 def poisson_offsets(rate: float, num_requests: int, rng: random.Random) -> list[float]:
@@ -395,6 +427,68 @@ def synthetic_prompts(
     ]
 
 
+SHARED_PREFIX_SENTENCE = (
+    "You are a helpful assistant. Answer accurately, cite your sources, and say "
+    "so plainly when you do not know. Keep responses concise unless asked to "
+    "elaborate. Do not speculate about facts you cannot verify. "
+)
+
+
+def shared_prefix_text(words: int) -> str:
+    """A deterministic stand-in for a system prompt, ``words`` words long.
+
+    Deterministic because the prefix cache keys on token identity: two requests
+    only share blocks if their prompts are byte-identical from position zero, so
+    a randomised prefix would measure nothing. The text is realistic enough to
+    tokenize like a real system prompt rather than compressing into a handful of
+    repeated tokens the way ``"token token token"`` would.
+    """
+    if words <= 0:
+        return ""
+    pool = SHARED_PREFIX_SENTENCE.split()
+    out = [pool[i % len(pool)] for i in range(words)]
+    return " ".join(out) + "\n\n"
+
+
+def apply_shared_prefix(
+    prompts: list[PromptRequest],
+    *,
+    words: int,
+    fraction: float,
+    rng: random.Random,
+) -> tuple[list[PromptRequest], int]:
+    """Prepend one identical prefix to ``fraction`` of the prompts.
+
+    Prefix caching is invisible on a workload where no two prompts share an
+    opening, which is exactly what ShareGPT is — every conversation starts
+    differently. Measuring the cache therefore needs a workload that *has* a
+    shared prefix, and needs the shared fraction to be a knob rather than a
+    constant, because the honest way to report a TTFT improvement is as a curve
+    against that fraction (roadmap Phase 8).
+
+    Returns the prompts and how many of them actually carry the prefix, so the
+    result file records the realised fraction rather than the requested one.
+    """
+    # Range check first: 0.0 is a legitimate sweep point meaning "no sharing",
+    # but a negative or >1 fraction is a typo, and treating it as "disabled"
+    # would silently produce the 0% arm under a label claiming otherwise.
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError(f"shared-prefix fraction must be in [0, 1], got {fraction}")
+    if words <= 0 or fraction == 0:
+        return prompts, 0
+
+    prefix = shared_prefix_text(words)
+    count = round(len(prompts) * fraction)
+    # Chosen by index rather than by shuffling the list: the arrival order is
+    # part of the experiment, and reordering it here would silently change the
+    # workload between the caching and non-caching arms.
+    chosen = set(rng.sample(range(len(prompts)), count)) if count else set()
+    out = [
+        replace(p, prompt=prefix + p.prompt) if i in chosen else p for i, p in enumerate(prompts)
+    ]
+    return out, len(chosen)
+
+
 def load_sharegpt(
     path: str | Path,
     num_requests: int,
@@ -458,7 +552,58 @@ def _build_backend(name: str, args: argparse.Namespace) -> BackendFn:
         )
         model, tokenizer = load_model_and_tokenizer(config)
         return HFBaselineBackend(model, tokenizer, config)
-    raise ValueError(f"unknown backend {name!r} (available: mock, hf)")
+    if name == "pagedserve":
+        from bench.pagedserve_backend import PagedServeBackend, StaticEngineBackend
+        from pagedserve.config import CacheConfig, SchedulerConfig
+        from pagedserve.engine import LLMEngine
+
+        if not args.model:
+            raise ValueError("--model is required for the pagedserve backend")
+        # --no-paging routes back to the Phase 1 contiguous cache. Keeping that
+        # arm alive turns the headline comparison into a controlled experiment
+        # with paging as the only variable, instead of a cross-system
+        # comparison confounded by a hundred implementation differences.
+        attn = "contiguous" if args.no_paging else "gather"
+        engine = LLMEngine.from_pretrained(
+            args.model,
+            device=args.device,
+            dtype=args.dtype,
+            cache=CacheConfig(
+                max_seq_len=args.max_seq_len,
+                max_num_seqs=args.max_num_seqs,
+                block_size=args.block_size,
+                num_blocks_override=args.num_blocks,
+                swap_space_blocks=args.swap_space_blocks,
+                # Off by default so the arm that measures the cache's effect has
+                # a control to measure against. The Phase 5 claim is a *paired*
+                # number -- TTFT with caching over TTFT without, same workload,
+                # same seed -- so the flag has to be settable per run.
+                enable_prefix_caching=args.enable_prefix_caching,
+            ),
+            scheduler=SchedulerConfig(
+                max_num_batched_tokens=args.max_num_batched_tokens,
+                max_num_seqs=args.max_num_seqs,
+                preemption_policy=args.preemption_policy,
+            ),
+            attn_backend=attn,
+        )
+        # Static batching is the arm for both the contiguous cache and the
+        # paged-without-scheduling comparison; the contiguous backend cannot do
+        # continuous batching at all, since its whole layout assumes lockstep.
+        if args.no_paging or args.static_batching:
+            backend = StaticEngineBackend(engine, max_batch_size=args.concurrency or 1)
+        else:
+            backend = PagedServeBackend(engine)
+        # The engine speaks token ids, so the run needs a tokenizer for the
+        # pre-pass. Attached here so _main_async finds it the same way it finds
+        # the HuggingFace baseline's.
+        from transformers import AutoTokenizer
+
+        from pagedserve.model.loader import resolve_model_path
+
+        backend.tokenizer = AutoTokenizer.from_pretrained(resolve_model_path(args.model))
+        return backend
+    raise ValueError(f"unknown backend {name!r} (available: mock, hf, pagedserve)")
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -501,6 +646,59 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=0.05,
         help="hf static batching: seconds to wait for a batch to fill.",
     )
+    parser.add_argument(
+        "--no-paging",
+        action="store_true",
+        help="pagedserve backend: use the Phase 1 contiguous KV cache. The "
+        "ablation arm -- same code, paging as the only variable.",
+    )
+    parser.add_argument(
+        "--static-batching",
+        action="store_true",
+        help="pagedserve backend: paged KV but static batching. Isolates the "
+        "scheduler from paging when compared against the default.",
+    )
+    parser.add_argument(
+        "--shared-prefix-words",
+        type=int,
+        default=0,
+        help="Prepend an identical synthetic system prompt of this many words. "
+        "0 disables it. ShareGPT conversations share no opening, so without "
+        "this a prefix-caching run has nothing to hit on.",
+    )
+    parser.add_argument(
+        "--shared-prefix-fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of requests carrying the shared prefix. Sweeping this "
+        "from 0 to 0.9 is what turns a TTFT claim into a curve.",
+    )
+    parser.add_argument(
+        "--enable-prefix-caching",
+        action="store_true",
+        help="pagedserve backend: reuse KV blocks across requests that share a "
+        "block-aligned prefix. Reuse needs staggered arrivals -- requests "
+        "admitted in the same step have no computed KV to share, so a burst "
+        "shows a 0%% hit rate and that is correct.",
+    )
+    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--max-seq-len", type=int, default=2048)
+    parser.add_argument("--max-num-seqs", type=int, default=32)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--num-blocks",
+        type=int,
+        default=None,
+        help="Skip capacity profiling and size the cache explicitly. Required "
+        "off CUDA, where free device memory cannot be measured.",
+    )
+    parser.add_argument("--swap-space-blocks", type=int, default=512)
+    parser.add_argument(
+        "--preemption-policy",
+        default="recompute",
+        choices=("recompute", "swap"),
+        help="How evicted sequences are handled under memory pressure.",
+    )
     parser.add_argument("--mock-ttft", type=float, default=0.01)
     parser.add_argument("--mock-itl", type=float, default=0.001)
     return parser.parse_args(argv)
@@ -518,6 +716,15 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
     else:
         prompts = synthetic_prompts(args.num_requests, max_tokens=args.max_tokens)
         dataset_name = "synthetic"
+
+    # Applied before tokenization so the shared span is tokenized as part of the
+    # prompt, exactly as a real system prompt would be.
+    prompts, num_prefixed = apply_shared_prefix(
+        prompts,
+        words=args.shared_prefix_words,
+        fraction=args.shared_prefix_fraction,
+        rng=rng,
+    )
 
     # A backend that owns a tokenizer can fill in the prompt lengths the dataset
     # loader refused to guess, which is what makes prompt throughput reportable.
@@ -555,9 +762,37 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
     if lag is not None:
         workload["dispatch_lag"] = lag.to_dict()
 
+    # The realised fraction, not the requested one: a TTFT number from a
+    # prefix-caching run is uninterpretable without the shared-prefix share of
+    # the workload it was measured on.
+    if args.shared_prefix_words > 0:
+        workload["shared_prefix"] = {
+            "words": args.shared_prefix_words,
+            "requested_fraction": args.shared_prefix_fraction,
+            "num_requests_with_prefix": num_prefixed,
+            "realised_fraction": num_prefixed / len(prompts) if prompts else None,
+        }
+
     # Evidence that a batching backend actually batched. Without this, a static
     # batching run that silently degraded to batches of one would be
     # indistinguishable from a sequential run in the result file.
+    if hasattr(backend, "engine") and backend.engine.scheduler is not None:
+        # Preemption counts are evidence, not trivia: a run whose throughput
+        # came at the cost of constant eviction is not the same result as one
+        # that never thrashed.
+        workload["scheduler"] = {
+            "steps": backend.steps,
+            "preemptions": backend.engine.scheduler.num_preemptions,
+        }
+
+    if hasattr(backend, "engine"):
+        stats = backend.engine.prefix_cache_stats()
+        if stats is not None:
+            # Hit rate alone is not interpretable, so tokens_saved travels with
+            # it: a hit on one block and a hit on a whole system prompt count
+            # the same and mean nothing alike.
+            workload["prefix_cache"] = stats
+
     batch_sizes = getattr(backend, "batch_sizes", None)
     if batch_sizes:
         workload["batching"] = {
@@ -572,8 +807,9 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
             "backend": args.backend,
             "mode": args.mode,
             "backend_config": (backend.config.to_dict() if hasattr(backend, "config") else None),
-            # The engine config dump lands here once an engine exists to dump.
-            "engine": None,
+            # The full EngineConfig dump AGENTS.md section 6 asks for. Without
+            # it a run is not reproducible, however good its numbers look.
+            "engine": (backend.engine.config_dict() if hasattr(backend, "engine") else None),
         },
         workload=workload,
         slo=slo if not slo.is_empty() else None,

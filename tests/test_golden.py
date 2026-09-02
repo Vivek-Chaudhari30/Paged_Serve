@@ -33,6 +33,10 @@ from pagedserve.engine import LLMEngine  # noqa: E402
 # Small, ungated, and already cached on the dev machine, so this test needs no
 # token and no network. Override to run the gate against another checkpoint.
 GOLDEN_MODEL = os.environ.get("PAGEDSERVE_GOLDEN_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+# The gate must pass on every device and dtype we run on, not just the laptop's.
+# On a T4 that means float16, since Turing has no bfloat16 at all.
+TEST_DEVICE = os.environ.get("PAGEDSERVE_TEST_DEVICE", "cpu")
+TEST_DTYPE = os.environ.get("PAGEDSERVE_TEST_DTYPE", "float32")
 
 # Fixed by design. A golden test whose prompts change is not a golden test.
 GOLDEN_PROMPTS = [
@@ -65,6 +69,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def pytest_report_header() -> str:
+    """State the gate's configuration in the test output.
+
+    A golden failure means nothing without the device and dtype it was produced
+    under: the same code passes in float32, passes in float16, and flips argmax
+    on near-ties in emulated bfloat16.
+    """
+    return f"golden gate: device={TEST_DEVICE} dtype={TEST_DTYPE} model={GOLDEN_MODEL}"
+
+
 @pytest.fixture(scope="module")
 def model_path() -> str:
     from pagedserve.model.loader import resolve_model_path
@@ -88,10 +102,16 @@ def reference(model_path, tokenizer):
     """HuggingFace greedy output, with the checkpoint's sampling knobs removed."""
     from transformers import AutoModelForCausalLM, GenerationConfig
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.float32).eval()
+    from bench.baseline_hf import dtype_kwarg
+
+    model = (
+        AutoModelForCausalLM.from_pretrained(model_path, **dtype_kwarg(getattr(torch, TEST_DTYPE)))
+        .to(TEST_DEVICE)
+        .eval()
+    )
 
     def generate(prompts: list[str], max_new_tokens: int) -> list[list[int]]:
-        encoded = tokenizer(prompts, return_tensors="pt", padding=True)
+        encoded = tokenizer(prompts, return_tensors="pt", padding=True).to(TEST_DEVICE)
         config = GenerationConfig(
             max_new_tokens=max_new_tokens,
             do_sample=False,
@@ -134,8 +154,8 @@ def build_engine(model_path: str, backend: str) -> LLMEngine:
     """
     return LLMEngine.from_pretrained(
         model_path,
-        device="cpu",
-        dtype="float32",
+        device=TEST_DEVICE,
+        dtype=TEST_DTYPE,
         cache=CacheConfig(max_seq_len=256, max_num_seqs=8, block_size=16, num_blocks_override=128),
         attn_backend=backend,
         debug_invariants=True,
@@ -418,8 +438,8 @@ class TestContinuousBatching:
         prompt_ids, expected = self.reference(paged_engine, tokenizer)
         starved = LLMEngine.from_pretrained(
             model_path,
-            device="cpu",
-            dtype="float32",
+            device=TEST_DEVICE,
+            dtype=TEST_DTYPE,
             cache=CacheConfig(
                 max_seq_len=256,
                 max_num_seqs=8,
@@ -443,4 +463,117 @@ class TestContinuousBatching:
         prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
         engine.generate_continuous(prompt_ids, max_tokens=12)
         engine.scheduler.free_finished()
+        engine.block_manager.check_invariants()
+
+
+class TestPrefixCaching:
+    """A prefix cache must be semantically invisible (AGENTS.md §2.2).
+
+    It reuses another request's K and V. If the hash chain is wrong, or a block
+    is indexed before its KV exists, or an evicted block is handed out while
+    still referenced, the symptom is fluent text conditioned on a context that
+    never existed — not a crash. Identical output with caching on and off is the
+    only assertion that catches that.
+    """
+
+    SYSTEM = (
+        "You are a helpful assistant. Answer concisely and accurately. "
+        "Always cite your reasoning. Never fabricate facts. "
+    ) * 4
+    QUESTIONS = [
+        "What is the capital of France?",
+        "What is 2 + 2?",
+        "Name three primary colours.",
+        "Who wrote Hamlet?",
+    ]
+
+    def engine(self, model_path, *, enabled, num_blocks=512):
+        return LLMEngine.from_pretrained(
+            model_path,
+            device=TEST_DEVICE,
+            dtype=TEST_DTYPE,
+            cache=CacheConfig(
+                max_seq_len=1024,
+                max_num_seqs=8,
+                block_size=16,
+                num_blocks_override=num_blocks,
+            ),
+            attn_backend="gather",
+            enable_prefix_caching=enabled,
+            debug_invariants=True,
+        )
+
+    def staggered(self, engine, prompt_ids, max_tokens=8):
+        """Run requests one after another, so earlier blocks are sealed first.
+
+        Requests admitted in the same step cannot reuse each other's blocks:
+        nothing has been through a forward pass yet, so there is no KV to share.
+        Reuse is between a request and an *earlier* one.
+        """
+        engine.start()
+        outputs = []
+        for ids in prompt_ids:
+            sequence = engine.add_request(ids, max_tokens=max_tokens)
+            while engine.scheduler.num_unfinished:
+                engine.step()
+            outputs.append(sequence.output_token_ids)
+        return outputs
+
+    def prompt_ids(self, tokenizer):
+        return [tokenizer(self.SYSTEM + q).input_ids for q in self.QUESTIONS]
+
+    def test_output_is_identical_with_caching_on_and_off(self, model_path, tokenizer):
+        prompts = self.prompt_ids(tokenizer)
+        off = self.staggered(self.engine(model_path, enabled=False), prompts)
+        on = self.staggered(self.engine(model_path, enabled=True), prompts)
+        assert off == on
+
+    def test_the_cache_actually_hits_on_a_shared_prefix(self, model_path, tokenizer):
+        """Otherwise the test above passes by doing nothing."""
+        engine = self.engine(model_path, enabled=True)
+        self.staggered(engine, self.prompt_ids(tokenizer))
+        stats = engine.prefix_cache_stats()
+        assert stats["hits"] > 0
+        assert stats["tokens_saved"] > 0
+
+    def test_a_batch_admitted_together_still_produces_correct_output(self, model_path, tokenizer):
+        """No reuse is available here, and that must not break anything."""
+        prompts = self.prompt_ids(tokenizer)
+        off = [
+            s.output_token_ids
+            for s in self.engine(model_path, enabled=False).generate_continuous(
+                prompts, max_tokens=8
+            )
+        ]
+        on = [
+            s.output_token_ids
+            for s in self.engine(model_path, enabled=True).generate_continuous(
+                prompts, max_tokens=8
+            )
+        ]
+        assert off == on
+
+    def test_output_survives_eviction_under_memory_pressure(self, model_path, tokenizer):
+        """A starved cache evicts constantly; that must stay invisible too.
+
+        Eviction is where a use-after-free would surface: hand out a block that
+        is still referenced and the holder's KV changes underneath it.
+        """
+        # Distinct prefixes on purpose. With a *shared* prefix the cache
+        # reuses blocks instead of demanding new ones, so a small cache is not
+        # actually under pressure -- the first version of this test asserted
+        # eviction and got none for exactly that reason.
+        prompts = [
+            tokenizer(f"Distinct preamble {i}. " * 12 + question).input_ids
+            for i, question in enumerate(self.QUESTIONS)
+        ]
+        expected = self.staggered(self.engine(model_path, enabled=False), prompts)
+        starved = self.engine(model_path, enabled=True, num_blocks=14)
+        assert self.staggered(starved, prompts) == expected
+        assert starved.prefix_cache_stats()["evictions"] > 0
+        starved.block_manager.check_invariants()
+
+    def test_no_blocks_leak_across_cached_runs(self, model_path, tokenizer):
+        engine = self.engine(model_path, enabled=True)
+        self.staggered(engine, self.prompt_ids(tokenizer))
         engine.block_manager.check_invariants()
