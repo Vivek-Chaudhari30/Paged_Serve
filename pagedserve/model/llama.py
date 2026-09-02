@@ -149,6 +149,7 @@ class CausalLM(nn.Module):
         position_ids: torch.Tensor,
         backend: AttentionBackend,
         metadata: AttentionMetadata,
+        logits_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the stack and return logits for the final position only.
 
@@ -157,13 +158,17 @@ class CausalLM(nn.Module):
             position_ids: ``[batch, seq]`` absolute positions for RoPE.
             backend: Where KV lives.
             metadata: Per-step backend state from ``begin_step``.
+            logits_indices: Flat positions to project, for a ragged batch where
+                every sequence ends somewhere different. ``None`` means the last
+                position of each row, which is what lockstep static batching
+                wants.
 
         Returns:
-            ``[batch, vocab_size]`` — logits for the last token of each
-            sequence. Only the final position is projected: during prefill the
-            other positions' logits are never used, and the LM head over a 152k
-            vocabulary is expensive enough that computing them all would
-            dominate prefill time.
+            ``[num_sampled, vocab_size]``.
+
+        Only the sampled positions are projected. During prefill the other
+        positions' logits are never read, and an LM head over a 152k vocabulary
+        is expensive enough that computing them all would dominate prefill time.
         """
         hidden = self.embed_tokens(input_ids)
         cos, sin = self.rotary(position_ids, self.dtype)
@@ -171,6 +176,13 @@ class CausalLM(nn.Module):
         for layer in self.layers:
             hidden = layer(hidden, cos, sin, backend, metadata)
 
-        hidden = self.norm(hidden[:, -1:, :])
+        if logits_indices is None:
+            selected = hidden[:, -1:, :]
+        else:
+            # Ragged: one row per sequence, taken from the flattened batch.
+            selected = hidden.view(-1, hidden.shape[-1])[logits_indices].unsqueeze(0)
+
+        selected = self.norm(selected)
         weight = self.embed_tokens.weight if self.lm_head is None else self.lm_head.weight
-        return torch.matmul(hidden, weight.t()).squeeze(1)
+        logits = torch.matmul(selected, weight.t())
+        return logits.squeeze(0) if logits_indices is not None else logits.squeeze(1)

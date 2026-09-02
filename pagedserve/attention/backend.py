@@ -100,8 +100,13 @@ class StepInput:
             do not start at index 0, and attending to a pad would silently
             corrupt the output rather than crash.
         is_prefill: Whether this step processes prompts.
-        block_tables: Phase 2. Per-sequence logical-to-physical block map.
-        slot_mapping: Phase 2. One flat KV slot index per token in the batch.
+        query_positions: ``[num_seqs, query_len]`` logical position of each
+            query token within its own sequence. A dense cache can infer this
+            from the batch's padded indices; a paged cache cannot, because it
+            stores a sequence at its own logical offsets and never stores
+            padding at all.
+        block_tables: Per-sequence logical-to-physical block map.
+        slot_mapping: One flat KV slot index per token in the batch.
     """
 
     query_len: int
@@ -109,6 +114,7 @@ class StepInput:
     seq_lens: torch.Tensor
     padding_mask: torch.Tensor
     is_prefill: bool
+    query_positions: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
     slot_mapping: torch.Tensor | None = None
 
@@ -146,8 +152,15 @@ class AttentionBackend(ABC):
     name: str = "abstract"
 
     @abstractmethod
-    def allocate(self, num_seq_slots: int, max_seq_len: int) -> None:
+    def allocate(self) -> None:
         """Reserve KV storage up front.
+
+        Takes no arguments on purpose. Sizing is a property of the backend and
+        its ``CacheConfig``, not something a caller supplies — a dense cache is
+        sized by sequence slots times max length, a paged one by a block count,
+        and a signature that named either would leak that layout into every
+        caller. This is the seam that lets Phase 4 drop in without touching the
+        engine.
 
         Called once at startup, never in the decode loop. Allocator calls in the
         hot loop cost microseconds, can synchronise the stream, and fragment

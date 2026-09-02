@@ -13,7 +13,7 @@ torch = pytest.importorskip("torch")
 
 from pagedserve.attention.backend import KVMemoryStats, StepInput  # noqa: E402
 from pagedserve.attention.contiguous import ContiguousAttentionBackend  # noqa: E402
-from pagedserve.config import ModelConfig  # noqa: E402
+from pagedserve.config import CacheConfig, ModelConfig  # noqa: E402
 
 TINY = ModelConfig(
     name="tiny",
@@ -32,9 +32,24 @@ TINY = ModelConfig(
 )
 
 
+def make_backend(max_num_seqs: int, max_seq_len: int) -> ContiguousAttentionBackend:
+    """Sizing now comes from CacheConfig, not from allocate()'s arguments.
+
+    A dense cache is sized by slots x max length and a paged one by a block
+    count; a shared allocate() signature naming either would leak that layout
+    into every caller.
+    """
+    return ContiguousAttentionBackend(
+        TINY,
+        CacheConfig(max_seq_len=max_seq_len, max_num_seqs=max_num_seqs),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+
 @pytest.fixture
 def backend():
-    return ContiguousAttentionBackend(TINY, device=torch.device("cpu"), dtype=torch.float32)
+    return make_backend(max_num_seqs=2, max_seq_len=16)
 
 
 def step(num_seqs=2, query_len=4, context_len=0, seq_lens=None, mask=None, prefill=True):
@@ -61,7 +76,8 @@ def qkv(num_seqs=2, query_len=4):
 
 class TestAllocation:
     def test_allocates_the_full_worst_case_shape(self, backend):
-        backend.allocate(num_seq_slots=4, max_seq_len=64)
+        backend = make_backend(4, 64)
+        backend.allocate()
         assert backend.kv_cache.shape == (2, 2, 4, 64, 2, 8)
 
     def test_forward_before_allocate_is_an_error(self, backend):
@@ -69,26 +85,31 @@ class TestAllocation:
             backend.begin_step(step())
 
     def test_free_is_idempotent(self, backend):
-        backend.allocate(2, 16)
+        backend = make_backend(2, 16)
+        backend.allocate()
         backend.free()
         backend.free()
         assert backend.kv_cache is None
 
     def test_reallocating_replaces_the_old_cache(self, backend):
-        backend.allocate(2, 16)
-        backend.allocate(4, 32)
+        backend = make_backend(2, 16)
+        backend.allocate()
+        backend = make_backend(4, 32)
+        backend.allocate()
         assert backend.kv_cache.shape[2] == 4
         assert backend.kv_cache.shape[3] == 32
 
     def test_rejects_a_sequence_longer_than_the_cache(self, backend):
-        backend.allocate(2, 8)
+        backend = make_backend(2, 8)
+        backend.allocate()
         with pytest.raises(ValueError, match="exceeds"):
             backend.begin_step(step(query_len=16))
 
 
 class TestMask:
     def test_is_causal_within_a_prefill(self, backend):
-        backend.allocate(2, 16)
+        backend = make_backend(2, 16)
+        backend.allocate()
         md = backend.begin_step(step(num_seqs=2, query_len=4))
         bias = md.attn_bias[0, 0]
         neg = torch.finfo(torch.float32).min
@@ -97,7 +118,8 @@ class TestMask:
         assert (bias[3, :4] == 0).all()
 
     def test_masks_left_padding(self, backend):
-        backend.allocate(2, 16)
+        backend = make_backend(2, 16)
+        backend.allocate()
         # Sequence 0 has two pad slots at the front.
         mask = torch.ones((2, 4), dtype=torch.bool)
         mask[0, :2] = False
@@ -110,7 +132,8 @@ class TestMask:
         assert (md.attn_bias[1, 0, 3, :] == 0).all()
 
     def test_decode_sees_the_whole_prefix(self, backend):
-        backend.allocate(2, 16)
+        backend = make_backend(2, 16)
+        backend.allocate()
         md = backend.begin_step(step(query_len=1, context_len=5, prefill=False))
         assert md.attn_bias.shape == (2, 1, 1, 6)
         assert (md.attn_bias == 0).all()
@@ -118,7 +141,8 @@ class TestMask:
     def test_uses_finfo_min_not_negative_infinity(self, backend):
         # A fully masked row would softmax -inf into NaN and poison the whole
         # tensor; a large negative degrades to a uniform row instead.
-        backend.allocate(1, 16)
+        backend = make_backend(1, 16)
+        backend.allocate()
         mask = torch.zeros((1, 2), dtype=torch.bool)
         md = backend.begin_step(step(num_seqs=1, query_len=2, mask=mask))
         assert torch.isfinite(md.attn_bias).all()
@@ -126,14 +150,16 @@ class TestMask:
 
 class TestForward:
     def test_output_shape(self, backend):
-        backend.allocate(2, 16)
+        backend = make_backend(2, 16)
+        backend.allocate()
         md = backend.begin_step(step())
         q, k, v = qkv()
         out = backend.forward(0, q, k, v, md)
         assert out.shape == (2, 4, TINY.num_q_heads, TINY.head_dim)
 
     def test_writes_kv_into_the_cache(self, backend):
-        backend.allocate(2, 16)
+        backend = make_backend(2, 16)
+        backend.allocate()
         md = backend.begin_step(step())
         q, k, v = qkv()
         backend.forward(0, q, k, v, md)
@@ -141,7 +167,8 @@ class TestForward:
         assert torch.equal(backend.kv_cache[0, 1, :2, :4], v)
 
     def test_layers_do_not_share_cache(self, backend):
-        backend.allocate(2, 16)
+        backend = make_backend(2, 16)
+        backend.allocate()
         md = backend.begin_step(step())
         q, k0, v0 = qkv()
         _, k1, v1 = qkv()
@@ -151,7 +178,8 @@ class TestForward:
         assert torch.equal(backend.kv_cache[1, 0, :2, :4], k1)
 
     def test_decode_reads_back_what_prefill_wrote(self, backend):
-        backend.allocate(1, 16)
+        backend = make_backend(1, 16)
+        backend.allocate()
         md = backend.begin_step(step(num_seqs=1, query_len=3))
         q, k, v = qkv(num_seqs=1, query_len=3)
         backend.forward(0, q, k, v, md)
@@ -167,7 +195,8 @@ class TestForward:
         """Each KV head must serve exactly num_queries_per_kv query heads."""
         import torch.nn.functional as F
 
-        backend.allocate(1, 16)
+        backend = make_backend(1, 16)
+        backend.allocate()
         md = backend.begin_step(step(num_seqs=1, query_len=4))
         q, k, v = qkv(num_seqs=1, query_len=4)
         out = backend.forward(0, q, k, v, md)
@@ -190,7 +219,8 @@ class TestForward:
         torch.manual_seed(0)
         q, k, v = qkv(num_seqs=1, query_len=3)
 
-        backend.allocate(1, 16)
+        backend = make_backend(1, 16)
+        backend.allocate()
         md = backend.begin_step(step(num_seqs=1, query_len=3))
         alone = backend.forward(0, q, k, v, md)
 
@@ -201,7 +231,8 @@ class TestForward:
         mask = torch.ones((1, 5), dtype=torch.bool)
         mask[0, :2] = False
 
-        backend.allocate(1, 16)
+        backend = make_backend(1, 16)
+        backend.allocate()
         md = backend.begin_step(
             step(num_seqs=1, query_len=5, mask=mask, seq_lens=torch.tensor([3]))
         )
@@ -226,7 +257,8 @@ class TestMemoryStats:
         assert KVMemoryStats(allocated_bytes=0, live_bytes=0).utilization is None
 
     def test_counts_only_real_tokens_as_live(self, backend):
-        backend.allocate(num_seq_slots=2, max_seq_len=100)
+        backend = make_backend(2, 100)
+        backend.allocate()
         # Two sequences, 10 real tokens each, in a cache sized for 100 apiece.
         backend.begin_step(
             step(num_seqs=2, query_len=10, seq_lens=torch.tensor([10, 10], dtype=torch.int32))
@@ -243,7 +275,8 @@ class TestMemoryStats:
         Counting them would flatter the utilization number this phase exists to
         expose.
         """
-        backend.allocate(2, 100)
+        backend = make_backend(2, 100)
+        backend.allocate()
         mask = torch.ones((2, 10), dtype=torch.bool)
         mask[0, :4] = False  # sequence 0 is 4 tokens of padding, 6 real
         backend.begin_step(

@@ -31,7 +31,7 @@ from pagedserve.attention.backend import (
     KVMemoryStats,
     StepInput,
 )
-from pagedserve.config import ModelConfig
+from pagedserve.config import CacheConfig, ModelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +64,13 @@ class ContiguousAttentionBackend(AttentionBackend):
     def __init__(
         self,
         model: ModelConfig,
+        cache: CacheConfig,
         *,
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
         self.model = model
+        self.cache = cache
         self.device = device
         self.dtype = dtype
         self.kv_cache: torch.Tensor | None = None
@@ -76,13 +78,17 @@ class ContiguousAttentionBackend(AttentionBackend):
         self.max_seq_len = 0
         self._live_tokens = 0
 
-    def allocate(self, num_seq_slots: int, max_seq_len: int) -> None:
+    def allocate(self) -> None:
         """Reserve the entire cache once, at startup.
 
-        Deliberately the worst-case shape: this is the arm whose waste is being
-        measured, so it must reserve exactly what a naive implementation would.
+        Sized to ``max_num_seqs x max_seq_len`` — the configured capacity of the
+        server, not the size of whatever batch happens to arrive. That is what a
+        naive implementation reserves, and sizing to actual demand instead would
+        understate exactly the waste this arm exists to measure.
         """
         self.free()
+        num_seq_slots = self.cache.max_num_seqs
+        max_seq_len = self.cache.max_seq_len
         self.num_seq_slots = num_seq_slots
         self.max_seq_len = max_seq_len
         self.kv_cache = torch.zeros(

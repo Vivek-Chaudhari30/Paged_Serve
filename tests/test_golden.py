@@ -27,12 +27,16 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
-from pagedserve.config import CacheConfig  # noqa: E402
+from pagedserve.config import CacheConfig, SchedulerConfig  # noqa: E402
 from pagedserve.engine import LLMEngine  # noqa: E402
 
 # Small, ungated, and already cached on the dev machine, so this test needs no
 # token and no network. Override to run the gate against another checkpoint.
 GOLDEN_MODEL = os.environ.get("PAGEDSERVE_GOLDEN_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+# The gate must pass on every device and dtype we run on, not just the laptop's.
+# On a T4 that means float16, since Turing has no bfloat16 at all.
+TEST_DEVICE = os.environ.get("PAGEDSERVE_TEST_DEVICE", "cpu")
+TEST_DTYPE = os.environ.get("PAGEDSERVE_TEST_DTYPE", "float32")
 
 # Fixed by design. A golden test whose prompts change is not a golden test.
 GOLDEN_PROMPTS = [
@@ -65,6 +69,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def pytest_report_header() -> str:
+    """State the gate's configuration in the test output.
+
+    A golden failure means nothing without the device and dtype it was produced
+    under: the same code passes in float32, passes in float16, and flips argmax
+    on near-ties in emulated bfloat16.
+    """
+    return f"golden gate: device={TEST_DEVICE} dtype={TEST_DTYPE} model={GOLDEN_MODEL}"
+
+
 @pytest.fixture(scope="module")
 def model_path() -> str:
     from pagedserve.model.loader import resolve_model_path
@@ -88,10 +102,16 @@ def reference(model_path, tokenizer):
     """HuggingFace greedy output, with the checkpoint's sampling knobs removed."""
     from transformers import AutoModelForCausalLM, GenerationConfig
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.float32).eval()
+    from bench.baseline_hf import dtype_kwarg
+
+    model = (
+        AutoModelForCausalLM.from_pretrained(model_path, **dtype_kwarg(getattr(torch, TEST_DTYPE)))
+        .to(TEST_DEVICE)
+        .eval()
+    )
 
     def generate(prompts: list[str], max_new_tokens: int) -> list[list[int]]:
-        encoded = tokenizer(prompts, return_tensors="pt", padding=True)
+        encoded = tokenizer(prompts, return_tensors="pt", padding=True).to(TEST_DEVICE)
         config = GenerationConfig(
             max_new_tokens=max_new_tokens,
             do_sample=False,
@@ -123,14 +143,43 @@ def _eos_ids(tokenizer) -> set[int]:
     return set(eos) if isinstance(eos, list) else {eos}
 
 
-@pytest.fixture(scope="module")
-def engine(model_path):
+def build_engine(model_path: str, backend: str) -> LLMEngine:
+    """An engine on the named backend, with allocator invariants checked.
+
+    ``num_blocks_override`` is required off CUDA: there is no way to measure
+    free host memory, and inventing a figure would put a fabricated number under
+    every capacity decision. 128 blocks x 16 tokens = 2048 slots, which is
+    exactly ``max_num_seqs x max_seq_len``, so the paged arm is given the same
+    capacity the dense arm reserves.
+    """
     return LLMEngine.from_pretrained(
         model_path,
-        device="cpu",
-        dtype="float32",
-        cache=CacheConfig(max_seq_len=256, max_num_seqs=8),
+        device=TEST_DEVICE,
+        dtype=TEST_DTYPE,
+        cache=CacheConfig(max_seq_len=256, max_num_seqs=8, block_size=16, num_blocks_override=128),
+        attn_backend=backend,
+        debug_invariants=True,
     )
+
+
+@pytest.fixture(scope="module", params=["contiguous", "gather"])
+def engine(request, model_path):
+    """Every golden assertion runs against every backend.
+
+    AGENTS.md §2.2 requires it, and it is what makes a new backend's first
+    failure a test failure rather than a subtly wrong benchmark six weeks later.
+    """
+    return build_engine(model_path, request.param)
+
+
+@pytest.fixture(scope="module")
+def dense_engine(model_path):
+    return build_engine(model_path, "contiguous")
+
+
+@pytest.fixture(scope="module")
+def paged_engine(model_path):
+    return build_engine(model_path, "gather")
 
 
 class TestGoldenOutput:
@@ -208,15 +257,82 @@ class TestGenerationMechanics:
             engine.generate([ids] * 9, max_tokens=4)
 
 
+class TestPagedEquivalence:
+    """Paging must be invisible to the tokens produced.
+
+    A memory layout change that alters output is a bug, not an optimisation.
+    This is the Phase 2 assertion: same tokens, far less memory.
+    """
+
+    def test_paged_and_dense_agree_bit_for_bit(self, dense_engine, paged_engine, tokenizer):
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        dense = dense_engine.generate(prompt_ids, max_tokens=MAX_NEW_TOKENS)
+        paged = paged_engine.generate(prompt_ids, max_tokens=MAX_NEW_TOKENS)
+        assert dense.token_ids == paged.token_ids
+        assert dense.finish_reasons == paged.finish_reasons
+
+    def test_paged_uses_far_less_memory_for_the_same_work(
+        self, dense_engine, paged_engine, tokenizer
+    ):
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        dense = dense_engine.generate(prompt_ids, max_tokens=MAX_NEW_TOKENS)
+        paged = paged_engine.generate(prompt_ids, max_tokens=MAX_NEW_TOKENS)
+        # Identical live bytes -- the same real tokens are cached either way.
+        assert dense.final_stats.live_bytes == paged.final_stats.live_bytes
+        # But the paged arm holds only the blocks it needs.
+        assert paged.final_stats.allocated_bytes < dense.final_stats.allocated_bytes
+        assert paged.final_stats.utilization > dense.final_stats.utilization
+
+    def test_block_manager_returns_everything_between_runs(self, paged_engine, tokenizer):
+        """No leaks across generate() calls.
+
+        A block that escapes the free list shrinks the cache silently, and the
+        symptom is a server that admits fewer requests the longer it runs.
+        """
+        manager = paged_engine.block_manager
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        paged_engine.generate(prompt_ids, max_tokens=8)
+        manager.check_invariants()
+        used_after_first = manager.num_used_blocks
+        paged_engine.generate(prompt_ids, max_tokens=8)
+        manager.check_invariants()
+        assert manager.num_used_blocks == used_after_first
+
+
+class TestPagedMemory:
+    def test_utilization_clears_the_phase_2_bar(self, paged_engine, tokenizer):
+        """Waste is bounded by the last partial block, not by max_seq_len.
+
+        The bound is ``block_size - 1`` tokens per sequence, so utilization
+        rises toward 100% as sequences lengthen. Short generations are dominated
+        by that partial block, which is why the threshold here is modest and the
+        trend matters more than the point.
+        """
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        short = paged_engine.generate(prompt_ids, max_tokens=16).final_stats
+        longer = paged_engine.generate(prompt_ids, max_tokens=64).final_stats
+        assert short.utilization > 0.50
+        assert longer.utilization > short.utilization
+
+    def test_never_exceeds_the_block_size_waste_bound(self, paged_engine, tokenizer):
+        """At most ``block_size - 1`` wasted token slots per sequence."""
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        stats = paged_engine.generate(prompt_ids, max_tokens=32).final_stats
+        per_token = paged_engine.config.model.kv_bytes_per_token(paged_engine.config.dtype)
+        wasted_slots = stats.wasted_bytes / per_token
+        block_size = paged_engine.config.cache.block_size
+        assert wasted_slots <= len(GOLDEN_PROMPTS) * (block_size - 1)
+
+
 class TestMemoryInstrumentation:
     """The utilization ratio is the whole point of Phase 1."""
 
-    def test_utilization_is_low_with_a_contiguous_cache(self, engine, tokenizer):
+    def test_utilization_is_low_with_a_contiguous_cache(self, dense_engine, tokenizer):
         # Short sequences in a cache sized for long ones. The vLLM paper
         # measured 20.4%-38.2% effective utilization in existing systems; a
         # contiguous reservation should land in that neighbourhood or below.
         prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
-        out = engine.generate(prompt_ids, max_tokens=16)
+        out = dense_engine.generate(prompt_ids, max_tokens=16)
         stats = out.final_stats
         assert stats is not None
         assert stats.utilization is not None
@@ -227,25 +343,25 @@ class TestMemoryInstrumentation:
             f"would understate the very waste this arm exists to measure."
         )
 
-    def test_live_bytes_grow_as_tokens_are_generated(self, engine, tokenizer):
-        out = engine.generate([tokenizer("The capital of France is").input_ids], max_tokens=8)
+    def test_live_bytes_grow_as_tokens_are_generated(self, dense_engine, tokenizer):
+        out = dense_engine.generate([tokenizer("The capital of France is").input_ids], max_tokens=8)
         live = [s.live_bytes for s in out.step_stats]
         assert live == sorted(live), "live bytes must be non-decreasing"
         assert live[-1] > live[0]
 
-    def test_allocated_bytes_never_change_during_a_run(self, engine, tokenizer):
+    def test_allocated_bytes_never_change_during_a_run(self, dense_engine, tokenizer):
         """The reservation is made once at startup, never grown in the loop."""
-        out = engine.generate([tokenizer("hello world").input_ids], max_tokens=8)
+        out = dense_engine.generate([tokenizer("hello world").input_ids], max_tokens=8)
         allocated = {s.allocated_bytes for s in out.step_stats}
         assert len(allocated) == 1
 
-    def test_utilization_matches_the_hand_computation(self, engine, tokenizer):
+    def test_utilization_matches_the_hand_computation(self, dense_engine, tokenizer):
         """Cross-check the instrumentation against the arithmetic by hand."""
         ids = tokenizer("The capital of France is").input_ids
-        out = engine.generate([ids], max_tokens=8)
+        out = dense_engine.generate([ids], max_tokens=8)
         stats = out.final_stats
-        model = engine.config.model
-        per_token = model.kv_bytes_per_token(engine.config.dtype)
+        model = dense_engine.config.model
+        per_token = model.kv_bytes_per_token(dense_engine.config.dtype)
 
         # Minus one: generating N tokens takes N forward passes, and the last
         # token sampled never goes back through the model, so its K and V are
@@ -254,5 +370,210 @@ class TestMemoryInstrumentation:
         cached_tokens = len(ids) + len(out.token_ids[0]) - 1
         assert stats.live_bytes == cached_tokens * per_token
 
-        expected_alloc = 1 * engine.config.cache.max_seq_len * per_token
+        # Sized to the server's configured capacity, not to this batch.
+        cache = dense_engine.config.cache
+        expected_alloc = cache.max_num_seqs * cache.max_seq_len * per_token
         assert stats.allocated_bytes == expected_alloc
+
+
+class TestContinuousBatching:
+    """Phase 3: iteration-level scheduling must not change what is produced.
+
+    Continuous batching is a throughput change, not a semantic one. If the
+    tokens differ from a static-batched run, the scheduler has a bug — the
+    comparison is against the same engine on the same backend, so nothing else
+    can account for a difference.
+    """
+
+    def reference(self, paged_engine, tokenizer):
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        return prompt_ids, paged_engine.generate(prompt_ids, max_tokens=MAX_NEW_TOKENS).token_ids
+
+    def test_matches_static_batching(self, model_path, paged_engine, tokenizer):
+        prompt_ids, expected = self.reference(paged_engine, tokenizer)
+        engine = build_engine(model_path, "gather")
+        sequences = engine.generate_continuous(prompt_ids, max_tokens=MAX_NEW_TOKENS)
+        assert [s.output_token_ids for s in sequences] == expected
+
+    def test_mixed_batch_composition_is_reached(self, model_path, tokenizer):
+        """One step really does hold a prefill and decodes at once."""
+        engine = build_engine(model_path, "gather")
+        engine.start()
+        engine.add_request(tokenizer(GOLDEN_PROMPTS[0]).input_ids, max_tokens=12)
+        engine.step()  # sequence 0 is now decoding
+        engine.add_request(tokenizer(GOLDEN_PROMPTS[1]).input_ids, max_tokens=12)
+        output = engine.step()
+        assert output.prefills and output.decodes
+        # Ragged: prefill length plus one decode token, not padded to the max.
+        assert output.num_batched_tokens == output.prefills[0].prompt_len + len(output.decodes)
+
+    def test_a_request_added_mid_flight_still_matches(self, model_path, tokenizer):
+        """Joining an in-progress batch must not perturb the joiner or the batch."""
+        engine = build_engine(model_path, "gather")
+        alone = engine.generate_continuous([tokenizer(GOLDEN_PROMPTS[1]).input_ids], max_tokens=16)[
+            0
+        ].output_token_ids
+
+        engine = build_engine(model_path, "gather")
+        engine.start()
+        engine.add_request(tokenizer(GOLDEN_PROMPTS[0]).input_ids, max_tokens=40)
+        for _ in range(5):
+            engine.step()
+        late = engine.add_request(tokenizer(GOLDEN_PROMPTS[1]).input_ids, max_tokens=16)
+        while engine.scheduler.num_unfinished:
+            engine.step()
+        assert late.output_token_ids == alone
+
+    @pytest.mark.parametrize("policy", ["recompute", "swap"])
+    def test_forced_preemption_is_invisible_in_the_output(
+        self, model_path, paged_engine, tokenizer, policy
+    ):
+        """The Phase 3 exit criterion, for both policies.
+
+        The cache is starved so eviction is unavoidable, and the resumed
+        sequences must produce exactly what an unpreempted run produced. A
+        preemption that changes a token is a correctness bug wearing an
+        optimisation's clothes.
+        """
+        prompt_ids, expected = self.reference(paged_engine, tokenizer)
+        starved = LLMEngine.from_pretrained(
+            model_path,
+            device=TEST_DEVICE,
+            dtype=TEST_DTYPE,
+            cache=CacheConfig(
+                max_seq_len=256,
+                max_num_seqs=8,
+                block_size=16,
+                num_blocks_override=6,
+                swap_space_blocks=64,
+            ),
+            scheduler=SchedulerConfig(
+                max_num_batched_tokens=2048, max_num_seqs=8, preemption_policy=policy
+            ),
+            attn_backend="gather",
+            debug_invariants=True,
+        )
+        sequences = starved.generate_continuous(prompt_ids, max_tokens=MAX_NEW_TOKENS)
+        assert starved.scheduler.num_preemptions > 0, "the cache was not starved enough"
+        assert [s.output_token_ids for s in sequences] == expected
+        starved.block_manager.check_invariants()
+
+    def test_blocks_are_all_returned_when_the_run_ends(self, model_path, tokenizer):
+        engine = build_engine(model_path, "gather")
+        prompt_ids = [tokenizer(p).input_ids for p in GOLDEN_PROMPTS]
+        engine.generate_continuous(prompt_ids, max_tokens=12)
+        engine.scheduler.free_finished()
+        engine.block_manager.check_invariants()
+
+
+class TestPrefixCaching:
+    """A prefix cache must be semantically invisible (AGENTS.md §2.2).
+
+    It reuses another request's K and V. If the hash chain is wrong, or a block
+    is indexed before its KV exists, or an evicted block is handed out while
+    still referenced, the symptom is fluent text conditioned on a context that
+    never existed — not a crash. Identical output with caching on and off is the
+    only assertion that catches that.
+    """
+
+    SYSTEM = (
+        "You are a helpful assistant. Answer concisely and accurately. "
+        "Always cite your reasoning. Never fabricate facts. "
+    ) * 4
+    QUESTIONS = [
+        "What is the capital of France?",
+        "What is 2 + 2?",
+        "Name three primary colours.",
+        "Who wrote Hamlet?",
+    ]
+
+    def engine(self, model_path, *, enabled, num_blocks=512):
+        return LLMEngine.from_pretrained(
+            model_path,
+            device=TEST_DEVICE,
+            dtype=TEST_DTYPE,
+            cache=CacheConfig(
+                max_seq_len=1024,
+                max_num_seqs=8,
+                block_size=16,
+                num_blocks_override=num_blocks,
+            ),
+            attn_backend="gather",
+            enable_prefix_caching=enabled,
+            debug_invariants=True,
+        )
+
+    def staggered(self, engine, prompt_ids, max_tokens=8):
+        """Run requests one after another, so earlier blocks are sealed first.
+
+        Requests admitted in the same step cannot reuse each other's blocks:
+        nothing has been through a forward pass yet, so there is no KV to share.
+        Reuse is between a request and an *earlier* one.
+        """
+        engine.start()
+        outputs = []
+        for ids in prompt_ids:
+            sequence = engine.add_request(ids, max_tokens=max_tokens)
+            while engine.scheduler.num_unfinished:
+                engine.step()
+            outputs.append(sequence.output_token_ids)
+        return outputs
+
+    def prompt_ids(self, tokenizer):
+        return [tokenizer(self.SYSTEM + q).input_ids for q in self.QUESTIONS]
+
+    def test_output_is_identical_with_caching_on_and_off(self, model_path, tokenizer):
+        prompts = self.prompt_ids(tokenizer)
+        off = self.staggered(self.engine(model_path, enabled=False), prompts)
+        on = self.staggered(self.engine(model_path, enabled=True), prompts)
+        assert off == on
+
+    def test_the_cache_actually_hits_on_a_shared_prefix(self, model_path, tokenizer):
+        """Otherwise the test above passes by doing nothing."""
+        engine = self.engine(model_path, enabled=True)
+        self.staggered(engine, self.prompt_ids(tokenizer))
+        stats = engine.prefix_cache_stats()
+        assert stats["hits"] > 0
+        assert stats["tokens_saved"] > 0
+
+    def test_a_batch_admitted_together_still_produces_correct_output(self, model_path, tokenizer):
+        """No reuse is available here, and that must not break anything."""
+        prompts = self.prompt_ids(tokenizer)
+        off = [
+            s.output_token_ids
+            for s in self.engine(model_path, enabled=False).generate_continuous(
+                prompts, max_tokens=8
+            )
+        ]
+        on = [
+            s.output_token_ids
+            for s in self.engine(model_path, enabled=True).generate_continuous(
+                prompts, max_tokens=8
+            )
+        ]
+        assert off == on
+
+    def test_output_survives_eviction_under_memory_pressure(self, model_path, tokenizer):
+        """A starved cache evicts constantly; that must stay invisible too.
+
+        Eviction is where a use-after-free would surface: hand out a block that
+        is still referenced and the holder's KV changes underneath it.
+        """
+        # Distinct prefixes on purpose. With a *shared* prefix the cache
+        # reuses blocks instead of demanding new ones, so a small cache is not
+        # actually under pressure -- the first version of this test asserted
+        # eviction and got none for exactly that reason.
+        prompts = [
+            tokenizer(f"Distinct preamble {i}. " * 12 + question).input_ids
+            for i, question in enumerate(self.QUESTIONS)
+        ]
+        expected = self.staggered(self.engine(model_path, enabled=False), prompts)
+        starved = self.engine(model_path, enabled=True, num_blocks=14)
+        assert self.staggered(starved, prompts) == expected
+        assert starved.prefix_cache_stats()["evictions"] > 0
+        starved.block_manager.check_invariants()
+
+    def test_no_blocks_leak_across_cached_runs(self, model_path, tokenizer):
+        engine = self.engine(model_path, enabled=True)
+        self.staggered(engine, self.prompt_ids(tokenizer))
+        engine.block_manager.check_invariants()

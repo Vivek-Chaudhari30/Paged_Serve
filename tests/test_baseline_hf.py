@@ -133,14 +133,14 @@ class TestResolveDtype:
         assert resolve_dtype(None, torch.device("cpu")) == torch.float32
         assert resolve_dtype(None, torch.device("mps")) == torch.float32
 
-    def test_cuda_prefers_bfloat16_when_supported(self, monkeypatch):
-        monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    def test_ampere_and_later_get_bfloat16(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda i: (8, 0))
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
         assert resolve_dtype(None, torch.device("cuda")) == torch.bfloat16
 
-    def test_cuda_falls_back_to_float16_without_bf16(self, monkeypatch):
-        # Turing (T4) and Volta (V100) have no bf16 at all. This fallback is a
-        # correctness requirement, not a preference -- see AGENTS.md §4.2.
-        monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    def test_turing_falls_back_to_float16(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda i: (7, 5))
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
         assert resolve_dtype(None, torch.device("cuda")) == torch.float16
 
 
