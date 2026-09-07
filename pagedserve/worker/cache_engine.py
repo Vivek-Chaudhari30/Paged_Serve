@@ -75,66 +75,72 @@ def profile_num_blocks(
     dtype: torch.dtype,
     weights_bytes: int,
     run_max_shape_forward: Callable[[], None] | None = None,
+    _memory_snapshot: tuple[int, int] | None = None,
 ) -> int:
     """Measure what is free, then derive the block count.
 
-    On CUDA this runs a forward pass at the largest shape the engine will ever
-    see and records peak allocation, because activation memory is a real claim
-    on the card that no static calculation predicts reliably — it depends on the
-    attention implementation, on autograd being off, and on whatever workspace
-    cuBLAS decides it wants.
+    Two-pass profile on CUDA: the caller supplies ``run_max_shape_forward``,
+    which should allocate a minimal provisional KV cache, run one forward step
+    at the maximum batch/sequence shape the engine will ever see, and free the
+    provisional cache before returning.  This function resets CUDA peak stats
+    before calling it, then reads the high-water mark to capture activation
+    memory as a real claim on the budget.
 
     Off CUDA there is no equivalent measurement: ``torch`` cannot report a
     meaningful free-memory figure for host RAM, and inventing one would put a
     fabricated number at the root of every capacity decision. So a non-CUDA
     device requires ``CacheConfig.num_blocks_override``, and says so.
 
-    **Known gap.** No caller supplies ``run_max_shape_forward`` yet, because
-    running a forward pass requires a KV cache and sizing the KV cache is what
-    this function is for. Until that is resolved with a two-pass profile,
-    activation memory is measured as zero and the block count is optimistic —
-    on a 15 GiB card it hands roughly 13 GiB to KV. The warning below says so
-    at runtime rather than leaving it to be discovered as an OOM.
+    Args:
+        run_max_shape_forward: Called once on CUDA to measure peak activation.
+            When ``None``, activation memory counts as zero and the block count
+            is optimistic — on a 15 GiB card it hands roughly 13 GiB to KV.
+        _memory_snapshot: ``(total_device_bytes, peak_activation_bytes)``
+            injected directly, bypassing all CUDA calls.  Unit-test hook only —
+            the leading underscore marks it as a private interface.
     """
     if cache.num_blocks_override is not None:
         logger.info("using num_blocks override: %d", cache.num_blocks_override)
         return cache.num_blocks_override
 
-    if device.type != "cuda":
+    if _memory_snapshot is not None:
+        total_bytes, peak_activation = _memory_snapshot
+    elif device.type != "cuda":
         raise ValueError(
             f"cannot profile KV cache capacity on device {device.type!r}: only CUDA "
             f"reports free device memory. Set CacheConfig.num_blocks_override to "
             f"size the cache explicitly on this device."
         )
-
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-
-    if run_max_shape_forward is not None:
-        run_max_shape_forward()
-        torch.cuda.synchronize()
     else:
-        # Loud, because the resulting number is optimistic in a way that only
-        # shows up as an OOM under load. Activation memory is real -- attention
-        # workspace, the logits tensor over a 150k vocabulary, whatever cuBLAS
-        # decides it wants -- and counting it as zero hands the KV cache memory
-        # that something else is going to ask for later.
-        logger.warning(
-            "sizing the KV cache without a profiling forward pass: activation "
-            "memory is being counted as zero, so this estimate is optimistic. "
-            "Set CacheConfig.num_blocks_override for a run that must not OOM."
-        )
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
-    peak_activation = max(0, torch.cuda.max_memory_allocated() - weights_bytes)
-    # device may be torch.device("cuda") with no index; resolve it explicitly
-    # rather than relying on every torch version to accept that.
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    total = torch.cuda.get_device_properties(index).total_memory
+        if run_max_shape_forward is not None:
+            run_max_shape_forward()
+            torch.cuda.synchronize()
+        else:
+            # Loud, because the resulting number is optimistic in a way that
+            # only shows up as an OOM under load.  Activation memory is real —
+            # attention workspace, the logits tensor over a 150k vocabulary,
+            # whatever cuBLAS decides it wants — and counting it as zero hands
+            # the KV cache memory that something else will ask for later.
+            logger.warning(
+                "sizing the KV cache without a profiling forward pass: activation "
+                "memory is being counted as zero, so this estimate is optimistic. "
+                "Set CacheConfig.num_blocks_override for a run that must not OOM."
+            )
+
+        peak_activation = max(0, torch.cuda.max_memory_allocated() - weights_bytes)
+        # device may be torch.device("cuda") with no index; resolve it explicitly
+        # rather than relying on every torch version to accept that.
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        total_bytes = torch.cuda.get_device_properties(index).total_memory
+
     block_bytes = bytes_per_block(model, cache.block_size, dtype)
 
     num_blocks = blocks_from_budget(
-        total_bytes=total,
+        total_bytes=total_bytes,
         weights_bytes=weights_bytes,
         peak_activation_bytes=peak_activation,
         utilization=cache.gpu_memory_utilization,
@@ -143,7 +149,7 @@ def profile_num_blocks(
     logger.info(
         "profiled KV capacity: %.1f GiB total, %.1f GiB weights, %.1f GiB peak "
         "activation, utilization %.2f -> %d blocks (%d token slots)",
-        total / 2**30,
+        total_bytes / 2**30,
         weights_bytes / 2**30,
         peak_activation / 2**30,
         cache.gpu_memory_utilization,

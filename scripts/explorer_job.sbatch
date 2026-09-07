@@ -21,6 +21,12 @@
 #   MODEL=meta-llama/Llama-3.2-1B-Instruct CONCURRENCIES="1 8 32" \
 #       sbatch scripts/explorer_job.sbatch
 #
+#   Run only the HF baselines:
+#   SECTIONS=baselines sbatch scripts/explorer_job.sbatch
+#
+#   Run only the pagedserve ablation arms:
+#   SECTIONS="contiguous paged_static paged_continuous" sbatch ...
+#
 # Every run writes its own JSON under results/. Those files are the evidence
 # for every number this project reports, so they are committed (AGENTS.md
 # section 6). Nothing here prints a speedup: ratios are computed later, by
@@ -36,6 +42,12 @@ WARMUP_REQUESTS="${WARMUP_REQUESTS:-32}"
 REPEATS="${REPEATS:-3}"
 DATASET="${DATASET:-}"
 RESULT_DIR="${RESULT_DIR:-results/$(date -u +%Y%m%dT%H%M%SZ)-${SLURM_JOB_ID:-local}}"
+# Space-separated list of sections to run. Default: all four.
+# Valid names: baselines  contiguous  paged_static  paged_continuous
+SECTIONS="${SECTIONS:-baselines contiguous paged_static paged_continuous}"
+
+# Returns 0 if the named section appears in $SECTIONS, 1 otherwise.
+section_enabled() { case " ${SECTIONS} " in *" $1 "*) return 0;; *) return 1;; esac; }
 
 module load cuda/12.1 2>/dev/null || echo "note: no module system, using the ambient CUDA"
 
@@ -64,6 +76,7 @@ python -c "import pagedserve; print('pagedserve', pagedserve.__version__)"
 mkdir -p "${RESULT_DIR}"
 echo "clocks_pinned=${CLOCKS_PINNED}" > "${RESULT_DIR}/run_notes.txt"
 echo "model=${MODEL}" >> "${RESULT_DIR}/run_notes.txt"
+echo "sections=${SECTIONS}" >> "${RESULT_DIR}/run_notes.txt"
 
 DATASET_ARG=""
 if [ -n "${DATASET}" ]; then
@@ -73,16 +86,44 @@ fi
 # Three repeats per point, because a single run is an anecdote. The median and
 # the run-to-run spread are computed downstream from these files; this script
 # only collects them.
-echo "==> sweep: baselines"
-for mode in sequential static; do
+
+if section_enabled baselines; then
+    echo "==> sweep: baselines"
+    for mode in sequential static; do
+        for c in ${CONCURRENCIES}; do
+            for run in $(seq 1 "${REPEATS}"); do
+                out="${RESULT_DIR}/hf-${mode}-c${c}-run${run}.json"
+                echo "--- hf/${mode} concurrency=${c} run=${run}"
+                python bench/loadgen.py \
+                    --backend hf \
+                    --model "${MODEL}" \
+                    --baseline-mode "${mode}" \
+                    --mode closed \
+                    --concurrency "${c}" \
+                    --num-requests "${NUM_REQUESTS}" \
+                    --max-tokens "${MAX_TOKENS}" \
+                    --warmup-requests "${WARMUP_REQUESTS}" \
+                    --seed "${run}" \
+                    ${DATASET_ARG} \
+                    --output "${out}"
+            done
+        done
+    done
+fi
+
+# pagedserve ablation arm 1: contiguous KV cache, static batching (the naive floor).
+# --no-paging routes to the Phase 1 contiguous path, making paging the only
+# variable when compared against paged_static.
+if section_enabled contiguous; then
+    echo "==> sweep: contiguous (no paging)"
     for c in ${CONCURRENCIES}; do
         for run in $(seq 1 "${REPEATS}"); do
-            out="${RESULT_DIR}/hf-${mode}-c${c}-run${run}.json"
-            echo "--- hf/${mode} concurrency=${c} run=${run}"
+            out="${RESULT_DIR}/ps-contiguous-c${c}-run${run}.json"
+            echo "--- pagedserve/contiguous concurrency=${c} run=${run}"
             python bench/loadgen.py \
-                --backend hf \
+                --backend pagedserve \
                 --model "${MODEL}" \
-                --baseline-mode "${mode}" \
+                --no-paging \
                 --mode closed \
                 --concurrency "${c}" \
                 --num-requests "${NUM_REQUESTS}" \
@@ -93,7 +134,54 @@ for mode in sequential static; do
                 --output "${out}"
         done
     done
-done
+fi
+
+# pagedserve ablation arm 2: paged KV cache, static batching. Isolates the
+# effect of paging alone from iteration-level scheduling.
+if section_enabled paged_static; then
+    echo "==> sweep: paged + static batching"
+    for c in ${CONCURRENCIES}; do
+        for run in $(seq 1 "${REPEATS}"); do
+            out="${RESULT_DIR}/ps-paged-static-c${c}-run${run}.json"
+            echo "--- pagedserve/paged-static concurrency=${c} run=${run}"
+            python bench/loadgen.py \
+                --backend pagedserve \
+                --model "${MODEL}" \
+                --static-batching \
+                --mode closed \
+                --concurrency "${c}" \
+                --num-requests "${NUM_REQUESTS}" \
+                --max-tokens "${MAX_TOKENS}" \
+                --warmup-requests "${WARMUP_REQUESTS}" \
+                --seed "${run}" \
+                ${DATASET_ARG} \
+                --output "${out}"
+        done
+    done
+fi
+
+# pagedserve ablation arm 3: paged KV cache, continuous batching (the headline).
+# No extra flags — this is the default pagedserve configuration.
+if section_enabled paged_continuous; then
+    echo "==> sweep: paged + continuous batching"
+    for c in ${CONCURRENCIES}; do
+        for run in $(seq 1 "${REPEATS}"); do
+            out="${RESULT_DIR}/ps-paged-continuous-c${c}-run${run}.json"
+            echo "--- pagedserve/paged-continuous concurrency=${c} run=${run}"
+            python bench/loadgen.py \
+                --backend pagedserve \
+                --model "${MODEL}" \
+                --mode closed \
+                --concurrency "${c}" \
+                --num-requests "${NUM_REQUESTS}" \
+                --max-tokens "${MAX_TOKENS}" \
+                --warmup-requests "${WARMUP_REQUESTS}" \
+                --seed "${run}" \
+                ${DATASET_ARG} \
+                --output "${out}"
+        done
+    done
+fi
 
 echo "==> done. results in ${RESULT_DIR}"
 echo "Commit them: they are the denominator of every claim this project makes."

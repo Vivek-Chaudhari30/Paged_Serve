@@ -102,6 +102,7 @@ class TestOptionalImport:
         assert first is second
 
 
+@pytest.mark.gpu
 @pytest.mark.cuda_ext
 @requires_extension
 class TestBuildCanary:

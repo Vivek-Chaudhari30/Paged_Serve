@@ -56,6 +56,7 @@ select = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = "--strict-markers"
 markers = [
     "gpu: requires a CUDA GPU. Deselect on a Mac with -m 'not gpu'.",

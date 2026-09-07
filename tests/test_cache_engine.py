@@ -159,3 +159,116 @@ class TestProfileNumBlocks:
             )
         assert "mps" in str(exc.value)
         assert "num_blocks_override" in str(exc.value)
+
+    def test_snapshot_injection_bypasses_cuda_measurement(self):
+        """_memory_snapshot lets the two-pass path be verified without a GPU.
+
+        The injection skips the device check, the CUDA synchronize, and
+        torch.cuda.get_device_properties — only the pure arithmetic runs.
+        """
+        total = 24 * GIB
+        peak = 1 * GIB
+        result = profile_num_blocks(
+            QWEN,
+            CacheConfig(),
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+            weights_bytes=2 * GIB,
+            _memory_snapshot=(total, peak),
+        )
+        expected = blocks_from_budget(
+            total_bytes=total,
+            weights_bytes=2 * GIB,
+            peak_activation_bytes=peak,
+            utilization=CacheConfig().gpu_memory_utilization,
+            block_bytes=bytes_per_block(QWEN, CacheConfig().block_size, torch.bfloat16),
+        )
+        assert result == expected
+
+    def test_snapshot_injection_zero_activation(self):
+        """When activation is zero the optimistic path produces the same result."""
+        total = 16 * GIB
+        result_injected = profile_num_blocks(
+            QWEN,
+            CacheConfig(),
+            device=torch.device("cpu"),
+            dtype=torch.bfloat16,
+            weights_bytes=GIB,
+            _memory_snapshot=(total, 0),
+        )
+        expected = blocks_from_budget(
+            total_bytes=total,
+            weights_bytes=GIB,
+            peak_activation_bytes=0,
+            utilization=CacheConfig().gpu_memory_utilization,
+            block_bytes=bytes_per_block(QWEN, CacheConfig().block_size, torch.bfloat16),
+        )
+        assert result_injected == expected
+
+
+@pytest.mark.gpu
+class TestProfileNumBlocksOnGpu:
+    """Real CUDA measurement.  Skipped everywhere CUDA is not available."""
+
+    def test_profiles_without_forward_pass(self):
+        """Without run_max_shape_forward the function still returns a sane count."""
+        result = profile_num_blocks(
+            QWEN,
+            CacheConfig(),
+            device=torch.device("cuda"),
+            dtype=torch.float16,
+            weights_bytes=0,
+        )
+        assert result > 0
+
+    def test_run_max_shape_forward_is_called(self):
+        """The two-pass: the profiling callable must be invoked."""
+        called = []
+
+        def noop_forward() -> None:
+            called.append(True)
+
+        result = profile_num_blocks(
+            QWEN,
+            CacheConfig(),
+            device=torch.device("cuda"),
+            dtype=torch.float16,
+            weights_bytes=0,
+            run_max_shape_forward=noop_forward,
+        )
+        assert called, "run_max_shape_forward was not called"
+        assert result > 0
+
+    def test_activation_reduces_the_block_count(self):
+        """A forward pass that allocates extra memory must shrink the cache.
+
+        This is the whole point of the two-pass: activation memory is a real
+        claim on the card, and counting it as zero hands the KV cache memory
+        that something else will ask for.
+        """
+        # Baseline: no forward pass, activation counted as zero.
+        baseline = profile_num_blocks(
+            QWEN,
+            CacheConfig(),
+            device=torch.device("cuda"),
+            dtype=torch.float16,
+            weights_bytes=0,
+        )
+
+        def allocating_forward() -> None:
+            # Allocate 256 MiB, then free it.  max_memory_allocated() still
+            # captures this high-water mark after the tensor is gone.
+            t = torch.zeros(256 * 2**20 // 4, dtype=torch.float32, device="cuda")
+            torch.cuda.synchronize()
+            del t
+
+        with_activation = profile_num_blocks(
+            QWEN,
+            CacheConfig(),
+            device=torch.device("cuda"),
+            dtype=torch.float16,
+            weights_bytes=0,
+            run_max_shape_forward=allocating_forward,
+        )
+
+        assert with_activation < baseline
