@@ -17,12 +17,14 @@ import pytest
 from bench.loadgen import (
     MockBackend,
     PromptRequest,
+    apply_shared_prefix,
     build_result,
     collect_environment,
     load_sharegpt,
     poisson_offsets,
     run_closed_loop,
     run_open_loop,
+    shared_prefix_text,
     synthetic_prompts,
     write_result,
 )
@@ -338,3 +340,73 @@ class TestEndToEnd:
         # And the records round-trip back into the metrics layer.
         restored = [RequestRecord.from_dict(d) for d in reloaded["requests"]]
         assert all(r.succeeded for r in restored)
+
+
+class TestSharedPrefix:
+    """The workload knob that makes prefix caching measurable at all.
+
+    ShareGPT conversations share no opening, so a prefix-caching run against it
+    has nothing to hit on. These assert the properties the measurement depends
+    on: the prefix is byte-identical across requests, the arrival order is not
+    disturbed, and the realised count is reported rather than assumed.
+    """
+
+    def test_disabled_by_default_returns_the_same_list(self):
+        prompts = synthetic_prompts(8, max_tokens=4)
+        out, count = apply_shared_prefix(prompts, words=0, fraction=1.0, rng=random.Random(0))
+        assert count == 0
+        assert out is prompts
+
+    def test_zero_fraction_prefixes_nothing(self):
+        prompts = synthetic_prompts(8, max_tokens=4)
+        out, count = apply_shared_prefix(prompts, words=16, fraction=0.0, rng=random.Random(0))
+        assert count == 0
+        assert out is prompts
+
+    def test_prefix_is_byte_identical_across_requests(self):
+        # The whole mechanism keys on token identity from position zero. A
+        # prefix that varied per request would cache nothing and the test would
+        # be measuring an empty cache.
+        prompts = synthetic_prompts(10, max_tokens=4)
+        prefix = shared_prefix_text(24)
+        out, count = apply_shared_prefix(prompts, words=24, fraction=1.0, rng=random.Random(0))
+        assert count == 10
+        assert {p.prompt[: len(prefix)] for p in out} == {prefix}
+
+    def test_fraction_controls_how_many_carry_it(self):
+        prompts = synthetic_prompts(20, max_tokens=4)
+        prefix = shared_prefix_text(16)
+        out, count = apply_shared_prefix(prompts, words=16, fraction=0.25, rng=random.Random(1))
+        assert count == 5
+        assert sum(p.prompt.startswith(prefix) for p in out) == 5
+
+    def test_arrival_order_is_preserved(self):
+        # Reordering here would silently change the workload between the
+        # caching and non-caching arms, and the comparison is paired.
+        prompts = synthetic_prompts(12, max_tokens=4)
+        out, _ = apply_shared_prefix(prompts, words=16, fraction=0.5, rng=random.Random(2))
+        assert [p.request_id for p in out] == [p.request_id for p in prompts]
+
+    def test_same_seed_selects_the_same_requests(self):
+        prompts = synthetic_prompts(12, max_tokens=4)
+        a, _ = apply_shared_prefix(prompts, words=16, fraction=0.5, rng=random.Random(7))
+        b, _ = apply_shared_prefix(prompts, words=16, fraction=0.5, rng=random.Random(7))
+        assert [p.prompt for p in a] == [p.prompt for p in b]
+
+    def test_original_prompt_survives_after_the_prefix(self):
+        prompts = synthetic_prompts(4, max_tokens=4)
+        prefix = shared_prefix_text(16)
+        out, _ = apply_shared_prefix(prompts, words=16, fraction=1.0, rng=random.Random(0))
+        for before, after in zip(prompts, out, strict=True):
+            assert after.prompt == prefix + before.prompt
+            assert after.max_tokens == before.max_tokens
+
+    def test_word_count_is_exact(self):
+        assert len(shared_prefix_text(37).split()) == 37
+        assert shared_prefix_text(0) == ""
+
+    @pytest.mark.parametrize("bad", [-0.1, 1.5])
+    def test_out_of_range_fraction_is_rejected(self, bad):
+        prompts = synthetic_prompts(4, max_tokens=4)
+        with pytest.raises(ValueError, match="fraction"):
+            apply_shared_prefix(prompts, words=8, fraction=bad, rng=random.Random(0))

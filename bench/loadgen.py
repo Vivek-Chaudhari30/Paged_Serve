@@ -39,7 +39,7 @@ import random
 import socket
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -427,6 +427,68 @@ def synthetic_prompts(
     ]
 
 
+SHARED_PREFIX_SENTENCE = (
+    "You are a helpful assistant. Answer accurately, cite your sources, and say "
+    "so plainly when you do not know. Keep responses concise unless asked to "
+    "elaborate. Do not speculate about facts you cannot verify. "
+)
+
+
+def shared_prefix_text(words: int) -> str:
+    """A deterministic stand-in for a system prompt, ``words`` words long.
+
+    Deterministic because the prefix cache keys on token identity: two requests
+    only share blocks if their prompts are byte-identical from position zero, so
+    a randomised prefix would measure nothing. The text is realistic enough to
+    tokenize like a real system prompt rather than compressing into a handful of
+    repeated tokens the way ``"token token token"`` would.
+    """
+    if words <= 0:
+        return ""
+    pool = SHARED_PREFIX_SENTENCE.split()
+    out = [pool[i % len(pool)] for i in range(words)]
+    return " ".join(out) + "\n\n"
+
+
+def apply_shared_prefix(
+    prompts: list[PromptRequest],
+    *,
+    words: int,
+    fraction: float,
+    rng: random.Random,
+) -> tuple[list[PromptRequest], int]:
+    """Prepend one identical prefix to ``fraction`` of the prompts.
+
+    Prefix caching is invisible on a workload where no two prompts share an
+    opening, which is exactly what ShareGPT is — every conversation starts
+    differently. Measuring the cache therefore needs a workload that *has* a
+    shared prefix, and needs the shared fraction to be a knob rather than a
+    constant, because the honest way to report a TTFT improvement is as a curve
+    against that fraction (roadmap Phase 8).
+
+    Returns the prompts and how many of them actually carry the prefix, so the
+    result file records the realised fraction rather than the requested one.
+    """
+    # Range check first: 0.0 is a legitimate sweep point meaning "no sharing",
+    # but a negative or >1 fraction is a typo, and treating it as "disabled"
+    # would silently produce the 0% arm under a label claiming otherwise.
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError(f"shared-prefix fraction must be in [0, 1], got {fraction}")
+    if words <= 0 or fraction == 0:
+        return prompts, 0
+
+    prefix = shared_prefix_text(words)
+    count = round(len(prompts) * fraction)
+    # Chosen by index rather than by shuffling the list: the arrival order is
+    # part of the experiment, and reordering it here would silently change the
+    # workload between the caching and non-caching arms.
+    chosen = set(rng.sample(range(len(prompts)), count)) if count else set()
+    out = [
+        replace(p, prompt=prefix + p.prompt) if i in chosen else p for i, p in enumerate(prompts)
+    ]
+    return out, len(chosen)
+
+
 def load_sharegpt(
     path: str | Path,
     num_requests: int,
@@ -512,6 +574,11 @@ def _build_backend(name: str, args: argparse.Namespace) -> BackendFn:
                 block_size=args.block_size,
                 num_blocks_override=args.num_blocks,
                 swap_space_blocks=args.swap_space_blocks,
+                # Off by default so the arm that measures the cache's effect has
+                # a control to measure against. The Phase 5 claim is a *paired*
+                # number -- TTFT with caching over TTFT without, same workload,
+                # same seed -- so the flag has to be settable per run.
+                enable_prefix_caching=args.enable_prefix_caching,
             ),
             scheduler=SchedulerConfig(
                 max_num_batched_tokens=args.max_num_batched_tokens,
@@ -591,6 +658,29 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="pagedserve backend: paged KV but static batching. Isolates the "
         "scheduler from paging when compared against the default.",
     )
+    parser.add_argument(
+        "--shared-prefix-words",
+        type=int,
+        default=0,
+        help="Prepend an identical synthetic system prompt of this many words. "
+        "0 disables it. ShareGPT conversations share no opening, so without "
+        "this a prefix-caching run has nothing to hit on.",
+    )
+    parser.add_argument(
+        "--shared-prefix-fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of requests carrying the shared prefix. Sweeping this "
+        "from 0 to 0.9 is what turns a TTFT claim into a curve.",
+    )
+    parser.add_argument(
+        "--enable-prefix-caching",
+        action="store_true",
+        help="pagedserve backend: reuse KV blocks across requests that share a "
+        "block-aligned prefix. Reuse needs staggered arrivals -- requests "
+        "admitted in the same step have no computed KV to share, so a burst "
+        "shows a 0%% hit rate and that is correct.",
+    )
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=32)
@@ -627,6 +717,15 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
         prompts = synthetic_prompts(args.num_requests, max_tokens=args.max_tokens)
         dataset_name = "synthetic"
 
+    # Applied before tokenization so the shared span is tokenized as part of the
+    # prompt, exactly as a real system prompt would be.
+    prompts, num_prefixed = apply_shared_prefix(
+        prompts,
+        words=args.shared_prefix_words,
+        fraction=args.shared_prefix_fraction,
+        rng=rng,
+    )
+
     # A backend that owns a tokenizer can fill in the prompt lengths the dataset
     # loader refused to guess, which is what makes prompt throughput reportable.
     tokenizer = getattr(backend, "tokenizer", None)
@@ -662,6 +761,17 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
     }
     if lag is not None:
         workload["dispatch_lag"] = lag.to_dict()
+
+    # The realised fraction, not the requested one: a TTFT number from a
+    # prefix-caching run is uninterpretable without the shared-prefix share of
+    # the workload it was measured on.
+    if args.shared_prefix_words > 0:
+        workload["shared_prefix"] = {
+            "words": args.shared_prefix_words,
+            "requested_fraction": args.shared_prefix_fraction,
+            "num_requests_with_prefix": num_prefixed,
+            "realised_fraction": num_prefixed / len(prompts) if prompts else None,
+        }
 
     # Evidence that a batching backend actually batched. Without this, a static
     # batching run that silently degraded to batches of one would be
