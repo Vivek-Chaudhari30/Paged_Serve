@@ -185,20 +185,40 @@ Grouped by where it runs. Nothing here is optional except where marked.
 
 ### 3.1 On your Mac, no GPU needed (do these first — they are cheap)
 
-- [ ] **M1 — Apply `@pytest.mark.gpu` to every test that needs a GPU** (fixes P2).
+- [x] **M1 — Apply `@pytest.mark.gpu` to every test that needs a GPU** (fixes P2).
       Verify `pytest -m "not gpu"` still passes clean on the Mac, and that
       `pytest -m gpu` collects a real, non-trivial number of tests.
       *Why first: without it, your first $1/hour AWS session reports a false green.*
-- [ ] **M2 — Correct `WORKTREE_SUMMARY.md`** to describe what exists (fixes P3).
+- [x] **M2 — Correct `WORKTREE_SUMMARY.md`** to describe what exists (fixes P3).
       *Why: it currently makes false claims on a public repo.*
-- [ ] **M3 — Update `README.md` status** from "Phase 0 of 9" to the real state (fixes P4).
-- [ ] **M4 — Dry-run the sweep runner at tiny scale on CPU.**
+- [x] **M3 — Update `README.md` status** from "Phase 0 of 9" to the real state (fixes P4).
+- [x] **M4 — Dry-run the sweep runner at tiny scale on CPU.**
       `scripts/explorer_job.sbatch` has **never been executed**. Shell bugs in it are free
       to find on a Mac and expensive to find on a metered GPU.
-- [ ] **M5 — Write an AWS launch/teardown script** (`scripts/aws_bench.sh`) that boots the
+- [x] **M5 — Write an AWS launch/teardown script** (`scripts/aws_bench.sh`) that boots the
       box, runs the sweep, pushes results, and **terminates itself on a timer**.
       *Why: the #1 way people get a surprise AWS bill is forgetting to shut down.*
-- [ ] **M6 — Set up the Conductor `_private/` bootstrap** (fixes P5). See §6.0.
+- [x] **M6 — Set up the Conductor `_private/` bootstrap** (fixes P5). See §6.0.
+
+> **Wave 1 is done** (2026-09-08, branch `wave-1/preflight`). Four commits:
+> test-run reporting and the GPU false-green guard; the documentation truth-up;
+> the sweep-script rehearsal and the `set -u` empty-array bug it found; the AWS
+> automation and runbook. Two findings worth carrying forward:
+>
+> 1. **M1's premise was half wrong.** The `gpu` markers audit clean — the only
+>    tests that genuinely cannot run without CUDA are the three
+>    `profile_num_blocks` measurements and the seven build canaries, and both
+>    were already marked. The false green is real but has a different cause:
+>    `pytest -m gpu` selects 10 of 482 tests and **the golden gate is not one of
+>    them**, because the gate is device-parametric rather than gpu-marked. The
+>    right GPU command is
+>    `PAGEDSERVE_TEST_DEVICE=cuda PAGEDSERVE_TEST_DTYPE=float16 pytest`.
+>    §3.2 step A4 below should be read with that substitution.
+> 2. **`explorer_job.sbatch` had a fatal bug.** The `continuous` ablation arm
+>    passes no flags, and under `set -u` an empty bash array is an unbound
+>    variable before bash 4.4 — the sweep died two thirds through, after the
+>    contiguous and paged arms, so the prefix and poisson sections never ran and
+>    the headline arm produced nothing. Found on a laptop for free.
 
 ### 3.2 On AWS — the first sweep (closes five phases at once)
 
@@ -507,11 +527,17 @@ session you start halts on its first message.
 **The fix.** In Conductor's per-workspace setup command, put:
 
 ```bash
-ln -sfn /Users/vivek/Developer/CODES/2026/Paged_Serve/_private "$PWD/_private"
+scripts/conductor_setup.sh
 ```
 
+It resolves the canonical `_private/` from git rather than a hardcoded path (so it keeps
+working if the repo moves), links it into the worktree, and then **verifies that
+`DESIGN.md` and `ROADMAP.md` are actually readable through the link** — a broken symlink
+and a working one look identical in `ls`, and the failure would otherwise show up only as
+an agent refusing to start. It is a no-op in the main worktree.
+
 If Conductor does not offer a setup hook, run that one line manually inside each new
-worktree before sending its prompt. Verify with `ls _private/DESIGN.md`.
+worktree before sending its prompt.
 
 ### §6.1 — Session opener (paste at the top of EVERY lane prompt)
 
