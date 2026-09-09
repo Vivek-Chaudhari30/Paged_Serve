@@ -246,8 +246,17 @@ benchmarks.
 ```bash
 ruff check . && ruff format --check .
 pytest -m "not gpu"                    # on Mac
-pytest                                 # on a GPU machine
+
+# On a GPU machine. The env vars are not optional: the golden gate is
+# device-parametric, so a bare `pytest` runs it on CPU and proves nothing about
+# the GPU.
+PAGEDSERVE_TEST_DEVICE=cuda PAGEDSERVE_TEST_DTYPE=float16 pytest
 ```
+
+**`pytest -m gpu` is not the GPU suite.** It selects only the ~10 tests that
+cannot run at all without CUDA, and the golden gate is not among them. A clean
+`-m gpu` run on a metered GPU box reads exactly like a passing GPU suite while
+the commit gate never ran. Use the command above.
 
 ### Benchmark protocol — follow exactly or the numbers are worthless
 
@@ -280,7 +289,18 @@ pytest                                 # on a GPU machine
 
 ## 7. Current status
 
-**Current phase: 6 — FastAPI server.**
+**Current phase: 2 (Wave 2) — the first GPU benchmark sweep.**
+
+Phases 0, 1, 2, 3, 5 and 6 are functionally complete and CPU-verified, with
+correctness additionally verified on a Tesla T4. Phase 4 is build scaffolding
+only — the decode kernel is not written. Phases 7, 8 and 9 have no code.
+
+`results/` does not exist. Five phases (0, 2, 3, 5, 6) each hang on exactly one
+unchecked box and it is the same box in every case: run the sweep on a GPU. One
+successful GPU session closes all five, and that is the next work. The plan for
+it is in `FINAL-COMPLETION.md`.
+
+**Previous phase: 6 — FastAPI server.**
 
 Phase 6 deliverables:
 - [x] OpenAI-compatible `/v1/completions` and `/v1/chat/completions`
