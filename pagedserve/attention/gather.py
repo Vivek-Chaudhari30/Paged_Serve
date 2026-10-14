@@ -28,7 +28,7 @@ write path a single fused scatter with no per-sequence branching.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
@@ -115,6 +115,17 @@ class RaggedMetadata(AttentionMetadata):
         return sum(self.query_lens)
 
 
+@dataclass
+class _StepPlan:
+    """Per-step tensors derived from a ``RaggedMetadata``, shared by all layers."""
+
+    metadata: RaggedMetadata
+    decode_starts: torch.Tensor
+    decode_block_tables: torch.Tensor
+    decode_seq_lens: torch.Tensor
+    biases: dict = field(default_factory=dict)
+
+
 class PagedAttentionBackend(AttentionBackend):
     """Block-table KV storage with a Python gather read path."""
 
@@ -138,6 +149,7 @@ class PagedAttentionBackend(AttentionBackend):
         self.kv_cache: torch.Tensor | None = None
         self._live_tokens = 0
         self._used_blocks = 0
+        self._step_plan: _StepPlan | None = None
 
     @property
     def trash_block_id(self) -> int:
@@ -175,6 +187,7 @@ class PagedAttentionBackend(AttentionBackend):
 
     def free(self) -> None:
         self.kv_cache = None
+        self._step_plan = None
         self._live_tokens = 0
         self._used_blocks = 0
 
@@ -351,32 +364,70 @@ class PagedAttentionBackend(AttentionBackend):
         v_cache.index_copy_(0, md.slot_mapping, flat_v)
 
         out = torch.empty_like(flat_q)
-        repeats = self.model.num_queries_per_kv
-
         if md.decode_rows:
-            rows = torch.tensor(md.decode_rows, dtype=torch.long, device=self.device)
-            starts = torch.tensor(
-                [md.query_offsets[r] for r in md.decode_rows],
-                dtype=torch.long,
-                device=self.device,
-            )
-            keys, values = self._gather(layer_idx, md.block_tables[rows], len(md.decode_rows))
-            # [n, heads, dim] -> [n, heads, 1, dim]: one query row per sequence.
-            q = flat_q[starts].unsqueeze(2)
-            bias = self._ragged_bias(md, md.decode_rows, query_len=1, gathered_len=md.gathered_len)
-            attended = self._sdpa(q, keys, values, bias, repeats)
-            out[starts] = attended[:, :, 0]
+            self._attend_decode_rows(layer_idx, flat_q, out, md)
+        self._attend_prefill_rows(layer_idx, flat_q, out, md)
+        return out.view(1, -1, num_q_heads, head_dim)
 
+    def _plan(self, md: RaggedMetadata) -> _StepPlan:
+        """Per-step index tensors, built on the first layer and reused by the rest.
+
+        Building them inside the layer loop would be ``num_layers`` host-to-device
+        copies of identical data per step. Keyed on the metadata object's
+        identity: a new step always brings a new metadata object.
+        """
+        plan = self._step_plan
+        if plan is not None and plan.metadata is md:
+            return plan
+        rows = torch.tensor(md.decode_rows, dtype=torch.long, device=self.device)
+        starts = torch.tensor(
+            [md.query_offsets[r] for r in md.decode_rows], dtype=torch.long, device=self.device
+        )
+        plan = _StepPlan(
+            metadata=md,
+            decode_starts=starts,
+            decode_block_tables=md.block_tables[rows],
+            decode_seq_lens=md.seq_lens[rows].to(torch.int32).contiguous(),
+        )
+        self._step_plan = plan
+        return plan
+
+    def _attend_decode_rows(
+        self, layer_idx: int, flat_q: torch.Tensor, out: torch.Tensor, md: RaggedMetadata
+    ) -> None:
+        """All single-token rows in one batched gather + SDPA call."""
+        plan = self._plan(md)
+        keys, values = self._gather(layer_idx, plan.decode_block_tables, len(md.decode_rows))
+        # [n, heads, dim] -> [n, heads, 1, dim]: one query row per sequence.
+        q = flat_q[plan.decode_starts].unsqueeze(2)
+        bias = plan.biases.get("decode")
+        if bias is None:
+            bias = self._ragged_bias(md, md.decode_rows, query_len=1, gathered_len=md.gathered_len)
+            plan.biases["decode"] = bias
+        attended = self._sdpa(q, keys, values, bias, self.model.num_queries_per_kv)
+        out[plan.decode_starts] = attended[:, :, 0]
+
+    def _attend_prefill_rows(
+        self, layer_idx: int, flat_q: torch.Tensor, out: torch.Tensor, md: RaggedMetadata
+    ) -> None:
+        """Multi-token rows, one at a time — the cold path by construction.
+
+        Shared with the CUDA backend, which replaces only the decode read.
+        """
+        if not md.prefill_rows:
+            return
+        plan = self._plan(md)
         for row in md.prefill_rows:
             start = md.query_offsets[row]
             length = md.query_lens[row]
             keys, values = self._gather(layer_idx, md.block_tables[row : row + 1], 1)
             q = flat_q[start : start + length].unsqueeze(0).transpose(1, 2)
-            bias = self._ragged_bias(md, (row,), query_len=length, gathered_len=md.gathered_len)
-            attended = self._sdpa(q, keys, values, bias, repeats)
+            bias = plan.biases.get(row)
+            if bias is None:
+                bias = self._ragged_bias(md, (row,), query_len=length, gathered_len=md.gathered_len)
+                plan.biases[row] = bias
+            attended = self._sdpa(q, keys, values, bias, self.model.num_queries_per_kv)
             out[start : start + length] = attended[0].transpose(0, 1)
-
-        return out.view(1, -1, num_q_heads, head_dim)
 
     def _gather(
         self, layer_idx: int, block_tables: torch.Tensor, num_seqs: int

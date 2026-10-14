@@ -30,10 +30,18 @@ from typing import Any
 
 import torch
 
+from pagedserve import extension
 from pagedserve.attention.backend import AttentionBackend, KVMemoryStats, StepInput
 from pagedserve.attention.contiguous import ContiguousAttentionBackend
+from pagedserve.attention.cuda_paged import CudaPagedAttentionBackend
 from pagedserve.attention.gather import PagedAttentionBackend, RaggedMetadata
-from pagedserve.config import CacheConfig, EngineConfig, ModelConfig, SchedulerConfig
+from pagedserve.config import (
+    CacheConfig,
+    EngineConfig,
+    ModelConfig,
+    SchedulerConfig,
+    resolve_device,
+)
 from pagedserve.core.policy import PreemptionMode
 from pagedserve.core.scheduler import Scheduler, SchedulerOutput
 from pagedserve.memory.block_manager import AllocStatus, BlockManager
@@ -42,6 +50,7 @@ from pagedserve.model.loader import load_state_dict, resolve_model_path
 from pagedserve.model.sampler import SamplingParams, SamplingTensors, greedy, sample
 from pagedserve.sequence import Sequence
 from pagedserve.worker.cache_engine import SwapSpace, profile_num_blocks
+from pagedserve.worker.cuda_graph import DecodeGraphRunner
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +65,11 @@ class _RaggedBatch:
     position_ids: torch.Tensor
     logits_indices: torch.Tensor
     metadata_input: RaggedMetadata
+    # Tokens each scheduled row ran this step, in scheduling order.
+    query_lens: list[int] = field(default_factory=list)
+    # Rows whose prefill completes this step and so produce a token. A row in
+    # the middle of a chunked prefill runs its chunk and samples nothing.
+    sample_rows: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -92,7 +106,24 @@ class GenerationOutput:
         )
 
 
-BACKENDS = ("contiguous", "gather")
+BACKENDS = ("contiguous", "gather", "cuda")
+
+
+def default_attn_backend(device: str | None = None) -> str:
+    """The fastest paged backend this machine can run: 'cuda' if possible, else 'gather'."""
+    resolved = resolve_device(device)
+    if resolved.type == "cuda" and extension.is_available():
+        return "cuda"
+    return "gather"
+
+
+def cuda_backend_unavailable_reason(config: EngineConfig) -> str | None:
+    """Why ``attn_backend='cuda'`` cannot run here, or ``None`` if it can."""
+    if config.device.type != "cuda":
+        return f"device is {config.device}, not CUDA"
+    if not extension.is_available():
+        return extension.unavailable_reason()
+    return None
 
 
 def _build_backend(
@@ -113,7 +144,15 @@ def _build_backend(
             ),
             None,
         )
-    if config.attn_backend == "gather":
+    if config.attn_backend == "cuda":
+        reason = cuda_backend_unavailable_reason(config)
+        if reason is not None:
+            # The kernel is an optimisation of the gather path, not a different
+            # semantics, so falling back is safe. The config is rewritten so a
+            # result file records the backend that actually ran.
+            logger.warning("attn_backend='cuda' unavailable (%s); using 'gather'", reason)
+            config.attn_backend = "gather"
+    if config.attn_backend in ("gather", "cuda"):
         num_blocks = profile_num_blocks(
             config.model,
             config.cache,
@@ -126,7 +165,10 @@ def _build_backend(
             config.cache.block_size,
             enable_prefix_caching=config.cache.enable_prefix_caching,
         )
-        backend = PagedAttentionBackend(
+        backend_cls = (
+            CudaPagedAttentionBackend if config.attn_backend == "cuda" else PagedAttentionBackend
+        )
+        backend = backend_cls(
             config.model,
             config.cache,
             num_blocks=num_blocks,
@@ -156,6 +198,7 @@ class LLMEngine:
         self.backend = backend
         self.block_manager = block_manager
         self.scheduler: Scheduler | None = None
+        self._graph_runner: DecodeGraphRunner | None = None
         self._next_seq_id = 0
         self._generator: torch.Generator | None = None
 
@@ -175,6 +218,7 @@ class LLMEngine:
         attn_backend: str = "gather",
         debug_invariants: bool = False,
         enable_prefix_caching: bool | None = None,
+        enable_cuda_graphs: bool = False,
     ) -> LLMEngine:
         """Load a checkpoint and build an engine around it.
 
@@ -193,6 +237,7 @@ class LLMEngine:
             scheduler=scheduler,
             attn_backend=attn_backend,
             debug_invariants=debug_invariants,
+            enable_cuda_graphs=enable_cuda_graphs,
         )
 
         module = CausalLM(model_config, config.dtype, config.device)
@@ -507,7 +552,31 @@ class LLMEngine:
             )
         self.scheduler = Scheduler(config, self.block_manager, swap_space=swap)
         self.scheduler.attach_kv_cache(lambda: self.backend.kv_cache)
+        self._graph_runner = self._maybe_capture_graphs()
         self._next_seq_id = 0
+
+    def _maybe_capture_graphs(self) -> DecodeGraphRunner | None:
+        if not self.config.enable_cuda_graphs:
+            return None
+        if not isinstance(self.backend, CudaPagedAttentionBackend) or (
+            self.config.device.type != "cuda"
+        ):
+            logger.warning(
+                "enable_cuda_graphs needs attn_backend='cuda' on a CUDA device; running eagerly"
+            )
+            return None
+        runner = DecodeGraphRunner(
+            self.model,
+            self.backend,
+            max_batch_size=min(
+                self.config.cuda_graph_max_batch_size, self.scheduler.config.max_num_seqs
+            ),
+            max_seq_len=self.config.cache.max_seq_len,
+            block_size=self.config.cache.block_size,
+            device=self.config.device,
+        )
+        runner.capture(self.block_manager.trash_block_id, self.config.cache.block_size)
+        return runner
 
     def add_request(
         self,
@@ -558,45 +627,62 @@ class LLMEngine:
         if output.is_empty:
             return output
 
-        batch = self._assemble(output.scheduled)
-        # The ragged metadata is complete as assembled; there is no per-step
-        # preparation left for the backend to do, so begin_step is skipped
-        # rather than given a no-op branch.
-        metadata = batch.metadata_input
         self.backend.set_used_blocks(self.block_manager.num_used_blocks)
-        logits = self.model(
-            batch.input_ids,
-            batch.position_ids,
-            self.backend,
-            metadata,
-            logits_indices=batch.logits_indices,
-        )
-        # Per-row parameters, staged once per step. An all-greedy batch short
-        # circuits to argmax inside sample(), so the path five phases of golden
-        # tests verified is untouched.
-        sampling = SamplingTensors.build(
-            [s.sampling for s in output.scheduled],
-            [s.all_token_ids for s in output.scheduled],
-            device=self.config.device,
-            dtype=torch.float32,
-        )
-        tokens = sample(logits, sampling, generator=self._generator).tolist()
-
-        for sequence, token in zip(output.scheduled, tokens, strict=True):
-            sequence.num_computed_tokens = sequence.total_len
+        logits, query_lens, sample_rows = self._forward_step(output.scheduled)
+        completing = [output.scheduled[row] for row in sample_rows]
+        tokens: list[int] = []
+        if completing:
+            # Per-row parameters, staged once per step. An all-greedy batch
+            # short circuits to argmax inside sample(), so the path five phases
+            # of golden tests verified is untouched. The .tolist() is the one
+            # host sync a step needs: the scheduler must see the tokens.
+            sampling = SamplingTensors.build(
+                [s.sampling for s in completing],
+                [s.all_token_ids for s in completing],
+                device=self.config.device,
+                dtype=torch.float32,
+            )
+            tokens = sample(logits, sampling, generator=self._generator).tolist()
+        for sequence, query_len in zip(output.scheduled, query_lens, strict=True):
+            sequence.num_computed_tokens += query_len
+            sequence.num_scheduled_tokens = 0
             # Seal now, after the forward pass: a block indexed before its K and
             # V exist would be served to another request as a hit, and that
             # request would attend over uninitialised memory.
             self.block_manager.seal(
                 sequence.seq_id, sequence.all_token_ids, sequence.num_computed_tokens
             )
+        for sequence, token in zip(completing, tokens, strict=True):
             sequence.append_token(token)
             sequence.check_stop()
-
         self.scheduler.append_slots(output.scheduled)
         if self.config.debug_invariants:
             self.block_manager.check_invariants()
         return output
+
+    def _forward_step(self, scheduled: list[Sequence]) -> tuple[torch.Tensor, list[int], list[int]]:
+        """Run the model for one scheduled batch.
+
+        Returns ``(logits for sample_rows, query_lens, sample_rows)``. A batch of
+        pure decodes that fits a captured bucket replays a CUDA graph; anything
+        else takes the eager ragged path.
+        """
+        runner = self._graph_runner
+        if runner is not None and runner.can_run(scheduled):
+            logits = runner.run(scheduled, self.block_manager)
+            return logits, [1] * len(scheduled), list(range(len(scheduled)))
+        batch = self._assemble(scheduled)
+        # The ragged metadata is complete as assembled; there is no per-step
+        # preparation left for the backend to do, so begin_step is skipped
+        # rather than given a no-op branch.
+        logits = self.model(
+            batch.input_ids,
+            batch.position_ids,
+            self.backend,
+            batch.metadata_input,
+            logits_indices=batch.logits_indices,
+        )
+        return logits, batch.query_lens, batch.sample_rows
 
     def generate_continuous(
         self,
@@ -605,13 +691,15 @@ class LLMEngine:
         *,
         stop_token_ids: tuple[int, ...] | None = None,
         max_steps: int = 100_000,
+        scheduler_config: SchedulerConfig | None = None,
     ) -> list[Sequence]:
         """Run every request to completion under continuous batching.
 
         Returns the sequences in submission order, so a caller can compare
-        against a static-batched run token for token.
+        against a static-batched run token for token. ``scheduler_config``
+        overrides the engine's scheduler for this run only.
         """
-        self.start()
+        self.start(scheduler_config)
         submitted = [
             self.add_request(ids, max_tokens, stop_token_ids=stop_token_ids)
             for ids in prompt_token_ids
@@ -649,23 +737,26 @@ class LLMEngine:
         prefill_rows: list[int] = []
 
         offset = 0
+        sample_rows: list[int] = []
         for row, sequence in enumerate(scheduled):
             start = sequence.num_computed_tokens
-            query_len = sequence.total_len - start
-            tokens = sequence.all_token_ids[start : sequence.total_len]
-
-            flat_tokens.extend(tokens)
-            flat_positions.extend(range(start, sequence.total_len))
+            remaining = sequence.total_len - start
+            # Chunked prefill may schedule fewer tokens than remain.
+            query_len = min(sequence.num_scheduled_tokens or remaining, remaining)
+            end = start + query_len
+            flat_tokens.extend(sequence.all_token_ids[start:end])
+            flat_positions.extend(range(start, end))
             slot_mapping.extend(manager.slots(sequence.seq_id, start, query_len))
-
             query_lens.append(query_len)
             query_offsets.append(offset)
-            seq_lens.append(sequence.total_len)
-            # Sample from each sequence's final query token.
-            logits_indices.append(offset + query_len - 1)
+            # Keys exist only up to the end of this chunk.
+            seq_lens.append(end)
+            if end == sequence.total_len:
+                # Sample from the final query token of a completed prefill.
+                logits_indices.append(offset + query_len - 1)
+                sample_rows.append(row)
             (decode_rows if query_len == 1 else prefill_rows).append(row)
             offset += query_len
-
         max_blocks = max(len(manager.block_table(s.seq_id)) for s in scheduled)
         tables = []
         for sequence in scheduled:
@@ -693,6 +784,8 @@ class LLMEngine:
                 live_tokens=sum(seq_lens),
                 used_blocks=manager.num_used_blocks,
             ),
+            query_lens=query_lens,
+            sample_rows=sample_rows,
         )
 
     @torch.inference_mode()

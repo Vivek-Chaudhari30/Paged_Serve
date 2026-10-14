@@ -138,16 +138,28 @@ class Scheduler:
 
         budget_tokens = self.config.max_num_batched_tokens
         budget_seqs = self.config.max_num_seqs
+        # Static batching admits only into an empty engine: the next batch
+        # waits for the slowest member of the current one.
+        may_admit = not (self.config.static_batching and (self.running or self.swapped))
+
+        running = self.running
+        if self.config.enable_chunked_prefill:
+            # Decodes first: each costs one token, and a long prefill ahead of
+            # them is exactly the stall chunking exists to bound.
+            running = [s for s in self.running if not s.is_prefill] + [
+                s for s in self.running if s.is_prefill
+            ]
 
         # Running sequences have first claim on the budget: they are already
         # holding memory, and starving them to admit new work is how a system
         # ends up with everything half-finished.
-        for sequence in self.running:
+        for sequence in running:
             if sequence.status is not SequenceStatus.RUNNING:
                 continue
-            tokens = sequence.num_uncomputed_tokens
+            tokens = self._chunk(sequence.num_uncomputed_tokens, budget_tokens)
             if tokens > budget_tokens or budget_seqs <= 0:
                 break
+            sequence.num_scheduled_tokens = tokens
             budget_tokens -= tokens
             budget_seqs -= 1
             if sequence.is_prefill:
@@ -157,8 +169,15 @@ class Scheduler:
             output.num_batched_tokens += tokens
 
         budget_tokens, budget_seqs = self._resume_swapped(output, budget_tokens, budget_seqs)
-        self._admit_waiting(output, budget_tokens, budget_seqs)
+        if may_admit:
+            self._admit_waiting(output, budget_tokens, budget_seqs)
         return output
+
+    def _chunk(self, tokens: int, budget_tokens: int) -> int:
+        """Tokens to run this step: all of them, or a budget-sized chunk."""
+        if self.config.enable_chunked_prefill and budget_tokens > 0:
+            return min(tokens, budget_tokens)
+        return tokens
 
     def _retire_finished(self, output: SchedulerOutput) -> None:
         still_running = []
@@ -298,11 +317,12 @@ class Scheduler:
                 break
             if len(cpu_blocks) > needed:
                 break
-            tokens = sequence.num_uncomputed_tokens
+            tokens = self._chunk(sequence.num_uncomputed_tokens, budget_tokens)
             if tokens > budget_tokens:
                 break
 
             self.swapped.popleft()
+            sequence.num_scheduled_tokens = tokens
             table, _ = self.block_manager.allocate(sequence.seq_id, sequence.total_len)
             self._do_swap_in(cpu_blocks, list(table)[: len(cpu_blocks)])
             self._swapped_blocks.pop(sequence.seq_id, None)
@@ -349,7 +369,7 @@ class Scheduler:
             growth = self.block_manager.blocks_needed(sequence.total_len + 1) - needed
             if needed + growth > self.block_manager.num_free_blocks - reserve:
                 break
-            if tokens > budget_tokens:
+            if self._chunk(tokens, budget_tokens) > budget_tokens:
                 break
 
             self.waiting.popleft()
@@ -361,7 +381,8 @@ class Scheduler:
             )
             if cached > sequence.num_computed_tokens:
                 sequence.num_computed_tokens = cached
-                tokens = sequence.num_uncomputed_tokens
+            tokens = self._chunk(sequence.num_uncomputed_tokens, budget_tokens)
+            sequence.num_scheduled_tokens = tokens
             sequence.status = SequenceStatus.RUNNING
             self.running.append(sequence)
             budget_tokens -= tokens

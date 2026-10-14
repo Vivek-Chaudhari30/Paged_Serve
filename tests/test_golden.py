@@ -162,14 +162,29 @@ def build_engine(model_path: str, backend: str) -> LLMEngine:
     )
 
 
-@pytest.fixture(scope="module", params=["contiguous", "gather"])
+@pytest.fixture(
+    scope="module",
+    params=[
+        "contiguous",
+        "gather",
+        pytest.param("cuda", marks=[pytest.mark.gpu, pytest.mark.cuda_ext]),
+    ],
+)
 def engine(request, model_path):
     """Every golden assertion runs against every backend.
 
     AGENTS.md §2.2 requires it, and it is what makes a new backend's first
     failure a test failure rather than a subtly wrong benchmark six weeks later.
+    The ``cuda`` arm refuses to silently become a second ``gather`` run.
     """
-    return build_engine(model_path, request.param)
+    if request.param == "cuda":
+        from pagedserve import extension
+
+        if TEST_DEVICE != "cuda" or not extension.is_available():
+            pytest.skip("cuda backend needs PAGEDSERVE_TEST_DEVICE=cuda and the built extension")
+    engine = build_engine(model_path, request.param)
+    assert engine.config.attn_backend == request.param
+    return engine
 
 
 @pytest.fixture(scope="module")
@@ -457,6 +472,33 @@ class TestContinuousBatching:
         assert starved.scheduler.num_preemptions > 0, "the cache was not starved enough"
         assert [s.output_token_ids for s in sequences] == expected
         starved.block_manager.check_invariants()
+
+    @pytest.mark.parametrize(
+        "scheduler",
+        [
+            pytest.param(
+                SchedulerConfig(max_num_batched_tokens=8, enable_chunked_prefill=True),
+                id="chunked-prefill",
+            ),
+            pytest.param(SchedulerConfig(static_batching=True), id="static-batching"),
+        ],
+    )
+    def test_scheduling_variants_are_invisible_in_the_output(
+        self, model_path, paged_engine, tokenizer, scheduler
+    ):
+        """Chunking a prompt or draining between batches changes when, not what.
+
+        An 8-token budget splits every golden prompt into several chunks, each
+        attending over the K/V the previous chunks wrote.
+        """
+        prompt_ids, expected = self.reference(paged_engine, tokenizer)
+        engine = paged_engine
+        sequences = engine.generate_continuous(
+            prompt_ids, max_tokens=MAX_NEW_TOKENS, scheduler_config=scheduler
+        )
+        assert [s.output_token_ids for s in sequences] == expected
+        engine.scheduler.free_finished()
+        engine.block_manager.check_invariants()
 
     def test_blocks_are_all_returned_when_the_run_ends(self, model_path, tokenizer):
         engine = build_engine(model_path, "gather")

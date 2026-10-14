@@ -563,7 +563,13 @@ def _build_backend(name: str, args: argparse.Namespace) -> BackendFn:
         # arm alive turns the headline comparison into a controlled experiment
         # with paging as the only variable, instead of a cross-system
         # comparison confounded by a hundred implementation differences.
-        attn = "contiguous" if args.no_paging else "gather"
+        from pagedserve.engine import default_attn_backend
+
+        attn = (
+            "contiguous"
+            if args.no_paging
+            else (args.attn_backend or default_attn_backend(args.device))
+        )
         engine = LLMEngine.from_pretrained(
             args.model,
             device=args.device,
@@ -584,8 +590,10 @@ def _build_backend(name: str, args: argparse.Namespace) -> BackendFn:
                 max_num_batched_tokens=args.max_num_batched_tokens,
                 max_num_seqs=args.max_num_seqs,
                 preemption_policy=args.preemption_policy,
+                enable_chunked_prefill=args.enable_chunked_prefill,
             ),
             attn_backend=attn,
+            enable_cuda_graphs=args.enable_cuda_graphs,
         )
         # Static batching is the arm for both the contiguous cache and the
         # paged-without-scheduling comparison; the contiguous backend cannot do
@@ -606,7 +614,8 @@ def _build_backend(name: str, args: argparse.Namespace) -> BackendFn:
     raise ValueError(f"unknown backend {name!r} (available: mock, hf, pagedserve)")
 
 
-def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
+    """The loadgen CLI. Public so bench/sweep.py can validate the commands it emits."""
     parser = argparse.ArgumentParser(
         description="PagedServe load generator: Poisson open-loop and closed-loop modes."
     )
@@ -699,9 +708,35 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("recompute", "swap"),
         help="How evicted sequences are handled under memory pressure.",
     )
+    parser.add_argument(
+        "--attn-backend",
+        default=None,
+        choices=("contiguous", "gather", "cuda"),
+        help="pagedserve backend: attention backend. Defaults to 'cuda' when the "
+        "compiled extension and a CUDA device are present, else 'gather'.",
+    )
+    parser.add_argument(
+        "--enable-chunked-prefill",
+        action="store_true",
+        help="pagedserve backend: split long prompts into token-budget chunks.",
+    )
+    parser.add_argument(
+        "--enable-cuda-graphs",
+        action="store_true",
+        help="pagedserve backend: replay decode steps from CUDA graphs (cuda backend).",
+    )
+    parser.add_argument(
+        "--arm",
+        default=None,
+        help="Ablation arm label written to workload.arm (set by bench/sweep.py).",
+    )
     parser.add_argument("--mock-ttft", type=float, default=0.01)
     parser.add_argument("--mock-itl", type=float, default=0.001)
-    return parser.parse_args(argv)
+    return parser
+
+
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
 
 async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
@@ -772,6 +807,10 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
             "num_requests_with_prefix": num_prefixed,
             "realised_fraction": num_prefixed / len(prompts) if prompts else None,
         }
+
+    if args.arm:
+        # An explicit label beats inference in bench/plot.py.
+        workload["arm"] = args.arm
 
     # Evidence that a batching backend actually batched. Without this, a static
     # batching run that silently degraded to batches of one would be

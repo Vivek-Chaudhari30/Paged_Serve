@@ -57,7 +57,12 @@ def build_config() -> tuple[list, dict]:
     print(f"Building the CUDA extension against {cuda_home}")
     extension = CUDAExtension(
         name="pagedserve._C",
-        sources=["csrc/bindings.cpp", "csrc/trivial.cu"],
+        sources=[
+            "csrc/bindings.cpp",
+            "csrc/trivial.cu",
+            "csrc/paged_attention.cu",
+            "csrc/cache_kernels.cu",
+        ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],
             # No -arch flag: torch infers the architectures of the visible GPUs,

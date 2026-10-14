@@ -37,7 +37,34 @@ def main(argv: list[str] | None = None) -> int:
         help="Use the Phase 1 contiguous cache. The ablation arm; it cannot do "
         "continuous batching, so it serves one request at a time.",
     )
+    parser.add_argument(
+        "--attn-backend",
+        default=None,
+        choices=("contiguous", "gather", "cuda"),
+        help="Attention backend. Defaults to 'cuda' when the compiled extension "
+        "and a CUDA device are present, else 'gather'. 'cuda' falls back to "
+        "'gather' with a warning when unavailable.",
+    )
+    parser.add_argument(
+        "--static-batching",
+        action="store_true",
+        help="Admit a new batch only once the previous one drains (ablation arm).",
+    )
+    parser.add_argument(
+        "--enable-chunked-prefill",
+        action="store_true",
+        help="Split long prompts into --max-num-batched-tokens chunks, decodes first.",
+    )
+    parser.add_argument(
+        "--enable-cuda-graphs",
+        action="store_true",
+        help="Replay pure-decode steps from captured CUDA graphs (cuda backend only).",
+    )
+    parser.add_argument("--preemption-policy", default="recompute", choices=("recompute", "swap"))
+    parser.add_argument("--swap-space-blocks", type=int, default=512)
     args = parser.parse_args(argv)
+    if args.no_paging and args.attn_backend not in (None, "contiguous"):
+        parser.error("--no-paging conflicts with --attn-backend " + args.attn_backend)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -45,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     from transformers import AutoTokenizer
 
     from pagedserve.config import CacheConfig, SchedulerConfig
-    from pagedserve.engine import LLMEngine
+    from pagedserve.engine import LLMEngine, default_attn_backend
     from pagedserve.model.loader import resolve_model_path
     from pagedserve.server.api import create_app
 
@@ -61,12 +88,19 @@ def main(argv: list[str] | None = None) -> int:
             block_size=args.block_size,
             num_blocks_override=args.num_blocks,
             enable_prefix_caching=args.enable_prefix_caching,
+            swap_space_blocks=args.swap_space_blocks,
         ),
         scheduler=SchedulerConfig(
             max_num_batched_tokens=args.max_num_batched_tokens,
             max_num_seqs=args.max_num_seqs,
+            preemption_policy=args.preemption_policy,
+            enable_chunked_prefill=args.enable_chunked_prefill,
+            static_batching=args.static_batching,
         ),
-        attn_backend="contiguous" if args.no_paging else "gather",
+        attn_backend="contiguous"
+        if args.no_paging
+        else (args.attn_backend or default_attn_backend(args.device)),
+        enable_cuda_graphs=args.enable_cuda_graphs,
     )
     app = create_app(engine, tokenizer, model_name=args.model)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

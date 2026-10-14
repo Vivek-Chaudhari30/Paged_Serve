@@ -248,12 +248,30 @@ class SchedulerConfig:
     max_num_batched_tokens: int = 8192
     max_num_seqs: int = 32
     preemption_policy: str = "recompute"
+    # Phase 7: split a long prefill across steps so it never takes more than
+    # ``max_num_batched_tokens`` of one step. Decodes are scheduled first and the
+    # prefill gets what is left, which bounds the stall a long prompt causes
+    # for everyone already decoding (the ITL tail).
+    enable_chunked_prefill: bool = False
+    # Phase 8 ablation arm: admit a new batch only when the previous one has
+    # fully drained. Same engine, same backend, no iteration-level scheduling.
+    static_batching: bool = False
+
+    def __post_init__(self) -> None:
+        if self.max_num_batched_tokens < 1:
+            raise ValueError(
+                f"max_num_batched_tokens must be positive, got {self.max_num_batched_tokens}"
+            )
+        if self.max_num_seqs < 1:
+            raise ValueError(f"max_num_seqs must be positive, got {self.max_num_seqs}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "max_num_batched_tokens": self.max_num_batched_tokens,
             "max_num_seqs": self.max_num_seqs,
             "preemption_policy": self.preemption_policy,
+            "enable_chunked_prefill": self.enable_chunked_prefill,
+            "static_batching": self.static_batching,
         }
 
 
@@ -270,6 +288,10 @@ class EngineConfig:
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     attn_backend: str = "contiguous"
     debug_invariants: bool = False
+    # Phase 7: replay pure-decode steps from captured CUDA graphs. Needs the
+    # cuda backend on a CUDA device; ignored with a warning otherwise.
+    enable_cuda_graphs: bool = False
+    cuda_graph_max_batch_size: int = 32
     _device: torch.device = field(default_factory=lambda: resolve_device(None))
     _dtype: torch.dtype | None = None
 
@@ -284,6 +306,8 @@ class EngineConfig:
         scheduler: SchedulerConfig | None = None,
         attn_backend: str = "contiguous",
         debug_invariants: bool = False,
+        enable_cuda_graphs: bool = False,
+        cuda_graph_max_batch_size: int = 32,
     ) -> EngineConfig:
         """Resolve device and dtype once, here, and hand them down."""
         resolved_device = resolve_device(device)
@@ -293,6 +317,8 @@ class EngineConfig:
             scheduler=scheduler or SchedulerConfig(),
             attn_backend=attn_backend,
             debug_invariants=debug_invariants,
+            enable_cuda_graphs=enable_cuda_graphs,
+            cuda_graph_max_batch_size=cuda_graph_max_batch_size,
             _device=resolved_device,
             _dtype=resolve_dtype(dtype, resolved_device),
         )
@@ -316,4 +342,6 @@ class EngineConfig:
             "device": str(self.device),
             "dtype": str(self.dtype).removeprefix("torch."),
             "debug_invariants": self.debug_invariants,
+            "enable_cuda_graphs": self.enable_cuda_graphs,
+            "cuda_graph_max_batch_size": self.cuda_graph_max_batch_size,
         }

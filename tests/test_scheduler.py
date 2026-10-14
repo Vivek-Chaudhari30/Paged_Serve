@@ -53,12 +53,16 @@ def make_scheduler(
     max_num_batched_tokens: int = 1024,
     policy: str = "recompute",
     swap: StubSwapSpace | None = None,
+    chunked: bool = False,
+    static: bool = False,
 ) -> Scheduler:
     manager = BlockManager(num_blocks, BLOCK_SIZE, watermark=0.0)
     config = SchedulerConfig(
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=max_num_seqs,
         preemption_policy=policy,
+        enable_chunked_prefill=chunked,
+        static_batching=static,
     )
     scheduler = Scheduler(config, manager, swap_space=swap)
     scheduler.attach_kv_cache(lambda: None)
@@ -75,11 +79,14 @@ def make_sequence(seq_id: int, prompt_len: int = 4, max_tokens: int = 100) -> Se
 
 
 def advance(scheduler: Scheduler, output, token: int = 1) -> None:
-    """Simulate the model: append a token to everything that ran."""
+    """Simulate the model: run each scheduled chunk, sample where a prefill completes."""
     for sequence in output.scheduled:
-        sequence.num_computed_tokens = sequence.total_len
-        sequence.append_token(token)
-        sequence.check_stop()
+        ran = sequence.num_scheduled_tokens or sequence.num_uncomputed_tokens
+        sequence.num_computed_tokens += ran
+        sequence.num_scheduled_tokens = 0
+        if sequence.num_computed_tokens == sequence.total_len:
+            sequence.append_token(token)
+            sequence.check_stop()
     scheduler.append_slots(output.scheduled)
 
 
@@ -359,3 +366,71 @@ class TestRaggedComposition:
         # Admitted on the very next iteration, mid-flight.
         assert any(s.seq_id == 1 for s in output.prefills)
         assert any(s.seq_id == 0 for s in output.decodes)
+
+
+class TestChunkedPrefill:
+    def test_a_long_prompt_is_split_across_steps(self):
+        scheduler = make_scheduler(max_num_batched_tokens=8, chunked=True)
+        sequence = make_sequence(0, prompt_len=20)
+        scheduler.add_request(sequence)
+        chunks = []
+        while sequence.output_len == 0:
+            output = scheduler.schedule()
+            chunks.append(sequence.num_scheduled_tokens)
+            advance(scheduler, output)
+        assert chunks == [8, 8, 4]
+        assert sequence.num_computed_tokens == 20
+
+    def test_without_chunking_the_prompt_waits_for_a_big_enough_budget(self):
+        scheduler = make_scheduler(max_num_batched_tokens=8)
+        scheduler.add_request(make_sequence(0, prompt_len=20))
+        assert scheduler.schedule().scheduled == []
+
+    def test_decodes_are_scheduled_before_a_prefill_chunk(self):
+        scheduler = make_scheduler(max_num_batched_tokens=8, chunked=True)
+        decoding = make_sequence(0, prompt_len=4)
+        scheduler.add_request(decoding)
+        advance(scheduler, scheduler.schedule())
+        assert not decoding.is_prefill
+        scheduler.add_request(make_sequence(1, prompt_len=40))
+        output = scheduler.schedule()
+        assert output.decodes == [decoding]
+        assert decoding.num_scheduled_tokens == 1
+        assert [s.num_scheduled_tokens for s in output.prefills] == [7]
+
+    def test_the_step_never_exceeds_the_token_budget(self):
+        scheduler = make_scheduler(num_blocks=64, max_num_batched_tokens=10, chunked=True)
+        for i in range(4):
+            scheduler.add_request(make_sequence(i, prompt_len=13, max_tokens=5))
+        while scheduler.has_work:
+            output = scheduler.schedule()
+            assert sum(s.num_scheduled_tokens for s in output.scheduled) <= 10
+            advance(scheduler, output)
+        scheduler.block_manager.check_invariants()
+        assert scheduler.block_manager.num_used_blocks == 0
+
+
+class TestStaticBatching:
+    def test_waits_for_the_batch_to_drain(self):
+        scheduler = make_scheduler(static=True)
+        short = make_sequence(0, max_tokens=1)
+        long = make_sequence(1, max_tokens=4)
+        scheduler.add_request(short)
+        scheduler.add_request(long)
+        advance(scheduler, scheduler.schedule())
+        late = make_sequence(2, max_tokens=1)
+        scheduler.add_request(late)
+        while long.finish_reason is None:
+            output = scheduler.schedule()
+            assert late not in output.scheduled
+            advance(scheduler, output)
+        output = scheduler.schedule()
+        assert output.scheduled == [late]
+
+    def test_continuous_admits_mid_flight(self):
+        scheduler = make_scheduler()
+        scheduler.add_request(make_sequence(0, max_tokens=4))
+        advance(scheduler, scheduler.schedule())
+        late = make_sequence(1, max_tokens=1)
+        scheduler.add_request(late)
+        assert late in scheduler.schedule().scheduled

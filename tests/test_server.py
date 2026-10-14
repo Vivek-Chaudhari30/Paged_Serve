@@ -299,12 +299,29 @@ class TestSamplingOverHttp:
         assert stopped["finish_reason"] == "stop"
 
 
+def _settled_free_blocks(engine, timeout: float = 10.0) -> int:
+    """Free blocks once the engine loop has drained.
+
+    Release happens on the engine loop, asynchronously to the HTTP response, so
+    an exact count is only meaningful once the scheduler has no work left.
+    """
+    import time
+
+    deadline = time.monotonic() + timeout
+    while engine.scheduler is not None and engine.scheduler.has_work:
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.01)
+    time.sleep(0.05)
+    return engine.block_manager.num_free_blocks
+
+
 class TestNoLeaks:
     """Blocks must come back. Every time, on every path."""
 
     def test_blocks_are_returned_after_a_completion(self, served):
         client, engine = served
-        before = engine.block_manager.num_free_blocks
+        before = _settled_free_blocks(engine)
         client.post(
             "/v1/completions",
             json={
@@ -314,12 +331,12 @@ class TestNoLeaks:
                 "temperature": 0,
             },
         )
-        assert engine.block_manager.num_free_blocks == before
+        assert _settled_free_blocks(engine) == before
         engine.block_manager.check_invariants()
 
     def test_blocks_are_returned_after_a_stream(self, served):
         client, engine = served
-        before = engine.block_manager.num_free_blocks
+        before = _settled_free_blocks(engine)
         client.post(
             "/v1/completions",
             json={
@@ -330,7 +347,7 @@ class TestNoLeaks:
                 "stream": True,
             },
         )
-        assert engine.block_manager.num_free_blocks == before
+        assert _settled_free_blocks(engine) == before
 
     def test_an_abandoned_stream_frees_its_blocks(self, served):
         """The leak the roadmap warns about, tested by the free-block count.
@@ -340,7 +357,7 @@ class TestNoLeaks:
         like from the server's side.
         """
         client, engine = served
-        before = engine.block_manager.num_free_blocks
+        before = _settled_free_blocks(engine)
         with client.stream(
             "POST",
             "/v1/completions",
@@ -354,13 +371,13 @@ class TestNoLeaks:
         ) as response:
             for _ in zip(response.iter_lines(), range(3), strict=False):
                 pass  # read a little, then abandon it
-        assert engine.block_manager.num_free_blocks == before
+        assert _settled_free_blocks(engine) == before
         engine.block_manager.check_invariants()
 
     def test_many_requests_do_not_erode_capacity(self, served):
         """A slow leak shows up as capacity falling over a run, not as an error."""
         client, engine = served
-        before = engine.block_manager.num_free_blocks
+        before = _settled_free_blocks(engine)
         for _ in range(5):
             client.post(
                 "/v1/completions",
@@ -371,4 +388,4 @@ class TestNoLeaks:
                     "temperature": 0,
                 },
             )
-        assert engine.block_manager.num_free_blocks == before
+        assert _settled_free_blocks(engine) == before

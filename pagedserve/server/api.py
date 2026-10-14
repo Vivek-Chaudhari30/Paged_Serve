@@ -26,7 +26,9 @@ string appears. The engine handles stop *tokens*, which need no decoding.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
+import functools
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -77,6 +79,24 @@ class EngineRunner:
         self._delivered: dict[int, int] = {}
         self._task: asyncio.Task | None = None
         self._started = False
+        # Aborts that arrive while a step is running in the worker thread are
+        # applied after it returns: the block manager is not thread-safe, and
+        # freeing a sequence under a step that is sealing its blocks corrupts it.
+        self._stepping = False
+        self._pending_aborts: list[Sequence] = []
+        # One worker keeps detokenization ordered and off the event loop
+        # without contending with the engine step for more than one core.
+        self._detok = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="pagedserve-detok"
+        )
+
+    async def detokenize(self, tokens: list[int]) -> str:
+        """Decode on the detokenizer thread (Phase 7 Q4)."""
+        snapshot = list(tokens)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._detok,
+            functools.partial(self.tokenizer.decode, snapshot, skip_special_tokens=True),
+        )
 
     async def start(self) -> None:
         if not self._started:
@@ -108,6 +128,12 @@ class EngineRunner:
         """
         self._queues.pop(sequence.seq_id, None)
         self._delivered.pop(sequence.seq_id, None)
+        if self._stepping:
+            self._pending_aborts.append(sequence)
+            return
+        self._release(sequence)
+
+    def _release(self, sequence: Sequence) -> None:
         scheduler = self.engine.scheduler
         if scheduler is None:
             return
@@ -126,6 +152,7 @@ class EngineRunner:
             if scheduler is None or not scheduler.has_work:
                 await asyncio.sleep(self.idle_sleep)
                 continue
+            self._stepping = True
             try:
                 output = await asyncio.to_thread(self.engine.step)
             except asyncio.CancelledError:
@@ -135,6 +162,15 @@ class EngineRunner:
                 for queue in self._queues.values():
                     queue.put_nowait(exc)
                 return
+            finally:
+                self._stepping = False
+                pending, self._pending_aborts = self._pending_aborts, []
+                for sequence in pending:
+                    self._release(sequence)
+            # Free finished sequences before telling their clients they are
+            # done, so a client that sees the end of its stream never observes
+            # its blocks still held.
+            scheduler.free_finished()
             for sequence in output.scheduled:
                 queue = self._queues.get(sequence.seq_id)
                 if queue is None:
@@ -175,7 +211,9 @@ async def stream_tokens(
             # multi-byte characters and byte-level BPE mean a single token can
             # be half a character, and decoding it alone yields a replacement
             # character that never resolves.
-            text = runner.tokenizer.decode(tokens, skip_special_tokens=True)
+            # Off the event loop: a slow decode would otherwise stall every
+            # other stream and the engine loop's token delivery with it.
+            text = await runner.detokenize(tokens)
             delta = text[len(emitted) :]
             emitted = text
 

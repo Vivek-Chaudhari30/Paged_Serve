@@ -75,6 +75,9 @@ class Sequence:
     num_preemptions: int = 0
     finish_reason: str | None = None
     arrival_index: int = 0
+    # Tokens the scheduler chose to run for this sequence in the current step.
+    # Equal to num_uncomputed_tokens unless chunked prefill split the prompt.
+    num_scheduled_tokens: int = 0
 
     @property
     def prompt_len(self) -> int:
