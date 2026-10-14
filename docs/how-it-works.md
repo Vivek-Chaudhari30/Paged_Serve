@@ -306,7 +306,7 @@ once shows a 0% hit rate, and that is correct behaviour, not a bug.
 
 ---
 
-## 8. What a "kernel" is, and the one that is not written yet
+## 8. What a "kernel" is, and the one written for this project
 
 A **kernel** is simply a small program that runs directly on the graphics card. **CUDA** is
 the language you write them in for NVIDIA cards.
@@ -323,19 +323,21 @@ This project handles it in three planned stages:
    slow**: it re-copies the entire working set on every single word. It stays in the repo
    forever as the reference that the fast version is checked against.
 2. **FlashAttention with block tables** — a production-grade library fallback, if needed.
-3. **A custom CUDA kernel** (**not started**) — teach the GPU to read the scattered blocks
-   in place, no copying. This is the hardest part of the project.
+3. **A custom CUDA kernel** (**written, not yet GPU-verified**) — teach the GPU to read the
+   scattered blocks in place, no copying. This is the hardest part of the project.
 
-What exists today for stage 3 is the build scaffolding: the toolchain compiles, a trivial
-test kernel round-trips a tensor on a real GPU, and the Python side falls back gracefully to
-the gather path on any machine without a CUDA toolkit. The attention kernel itself is
-unwritten.
+Stage 3 now exists as source: `csrc/paged_attention.cu` reads K/V straight through the block
+table with an online softmax, and `csrc/cache_kernels.cu` writes, copies and swaps blocks.
+A pure-PyTorch twin (`pagedserve/attention/paged_reference.py`) with identical signatures
+lets the whole `cuda` backend be tested on a laptop. The CUDA code itself has not yet been
+compiled or run; until it passes the GPU tests, `attn_backend="cuda"` falls back to gather
+on any machine that cannot run it.
 
 ---
 
 ## 9. Where the project stands today
 
-Nine planned phases. Seven have landed.
+Nine planned phases. All have code; the GPU-only parts await a GPU run.
 
 | Phase | What it added | Status |
 |---|---|---|
@@ -343,12 +345,12 @@ Nine planned phases. Seven have landed.
 | 1 | Hand-written model, contiguous cache, correctness gate | done |
 | 2 | Paged memory allocator, gather read path | done |
 | 3 | Continuous batching scheduler, both eviction policies | done |
-| 4 | CUDA build scaffolding | scaffolding only — kernel not started |
+| 4 | CUDA paged-attention + cache kernels, `cuda` backend | written; CPU-tested via reference ops; not GPU-verified |
 | 5 | Prefix caching with chained hashes and LRU eviction | done |
 | 6 | OpenAI-compatible HTTP server, streaming, full sampling | done |
-| 7 | Chunked prefill, CUDA graphs, latency polish | not started |
-| 8 | Ablations and honest comparison against vLLM | not started |
-| 9 | Writeup, README, real numbers | not started |
+| 7 | Chunked prefill, CUDA graphs, async detokenization | written; chunked prefill golden-verified on CPU |
+| 8 | Ablation flags, sweep driver, charts | tooling done; no sweep run |
+| 9 | Design doc, vLLM gap analysis, Q&A | written; real numbers await a sweep |
 
 **Correctness is genuinely established.** A "golden test" checks that this engine produces
 *the exact same words* as HuggingFace's reference implementation — not similar, identical —

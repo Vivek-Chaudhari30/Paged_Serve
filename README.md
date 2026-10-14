@@ -13,16 +13,32 @@ without depending on any of them at runtime.
 | 1 | Naive engine, contiguous KV cache | complete |
 | 2 | Paged KV cache (Python gather backend) | complete |
 | 3 | Continuous batching scheduler | complete |
-| 4 | **Custom CUDA paged attention kernel** | **build scaffolding only — the kernel is not written** |
+| 4 | Custom CUDA paged attention kernel | code complete, CPU-tested through reference ops — **not yet compiled or run on a GPU** |
 | 5 | Block-aligned prefix caching | complete |
 | 6 | OpenAI-compatible HTTP server | complete |
-| 7 | Chunked prefill, CUDA graphs | not started |
-| 8 | Ablations | not started |
-| 9 | Writeup | not started |
+| 7 | Chunked prefill, CUDA graphs, async detokenization | code complete; chunked prefill golden-verified on CPU; CUDA graphs GPU-unverified |
+| 8 | Ablations | tooling complete (CLI flags, `bench/sweep.py`, charts); **no sweep run** |
+| 9 | Writeup | design, vLLM gap and Q&A docs written; results sections await a sweep |
 
-Every completed phase is CPU-verified, and correctness is additionally verified on a Tesla T4
-(see below). Every completed phase also has exactly one open box, and it is the same box in
+Every completed phase is CPU-verified, and phases 0–6 are additionally verified on a Tesla T4
+(see below). The Phase 4 kernel (`csrc/paged_attention.cu`, `csrc/cache_kernels.cu`) and
+Phase 7 CUDA graphs were written without access to a CUDA toolkit; they must pass
+`pytest -m gpu` and the golden gate with `PAGEDSERVE_TEST_DEVICE=cuda` before any claim is
+made about them. See [docs/design.md](docs/design.md). Every completed phase also has exactly one open box, and it is the same box in
 each: **run the benchmark sweep on a GPU.** `results/` does not exist yet.
+
+## Running
+
+```bash
+python -m pagedserve.server --model Qwen/Qwen2.5-0.5B-Instruct --num-blocks 512 \
+    [--attn-backend {contiguous,gather,cuda}] [--no-paging] [--static-batching] \
+    [--enable-prefix-caching] [--enable-chunked-prefill] [--enable-cuda-graphs] \
+    [--preemption-policy {recompute,swap}]
+```
+
+`--attn-backend` defaults to `cuda` when the extension is built and a GPU is present, else
+`gather`. Ablation sweeps: `python -m bench.sweep {arms,block-size,preemption,prefix} --help`;
+charts from committed results: `scripts/make_charts.sh results docs/charts`.
 
 ## Scope
 

@@ -100,6 +100,12 @@ class RunRecord:
     itl_p99: float | None
     # summary.kv_utilization or workload.kv_stats.mean_utilization.
     kv_utilization: float | None
+    # config.engine.cache.block_size (pagedserve runs only).
+    block_size: int | None = None
+    # config.engine.scheduler.preemption_policy (pagedserve runs only).
+    preemption_policy: str | None = None
+    # workload.scheduler.preemptions.
+    preemptions: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +227,9 @@ def _parse_result(path: Path) -> RunRecord | None:
         itl_p95=summary.get("itl_p95"),
         itl_p99=summary.get("itl_p99"),
         kv_utilization=kv_util,
+        block_size=(engine_cfg.get("cache") or {}).get("block_size"),
+        preemption_policy=(engine_cfg.get("scheduler") or {}).get("preemption_policy"),
+        preemptions=(workload.get("scheduler") or {}).get("preemptions"),
     )
 
 
@@ -552,12 +561,127 @@ def plot_kv_utilization(
 
 
 # ---------------------------------------------------------------------------
+# Chart 6 — block-size sweep (Phase 8 B2)
+# ---------------------------------------------------------------------------
+
+
+def plot_vs_block_size(
+    records: list[RunRecord],
+    out_dir: Path,
+    hw_label: str,
+) -> bool:
+    """Throughput and KV utilization against block size, for paged arms.
+
+    Needs at least two distinct block sizes; a single point is not a sweep.
+    """
+    usable = [
+        r for r in records if r.block_size is not None and r.arm in ("ps-paged", "ps-continuous")
+    ]
+    if len({r.block_size for r in usable}) < 2:
+        print(f"[block-size] skipping '{hw_label}': need >= 2 block sizes on a paged arm")
+        return False
+
+    fig, (ax_tp, ax_kv) = plt.subplots(1, 2, figsize=(12, 5))
+    for arm in ("ps-paged", "ps-continuous"):
+        tp: dict[float, list[float]] = {}
+        kv: dict[float, list[float]] = {}
+        for r in usable:
+            if r.arm != arm:
+                continue
+            if r.output_throughput is not None:
+                tp.setdefault(float(r.block_size), []).append(r.output_throughput)
+            if r.kv_utilization is not None:
+                kv.setdefault(float(r.block_size), []).append(r.kv_utilization)
+        color = _ARM_COLORS.get(arm, "gray")
+        label = _ARM_LABELS.get(arm, arm)
+        for ax, data in ((ax_tp, tp), (ax_kv, kv)):
+            xs, meds, lo, hi = _median_band(data)
+            if not xs:
+                continue
+            ax.plot(xs, meds, marker="o", color=color, label=label)
+            if len(xs) > 1:
+                ax.fill_between(xs, lo, hi, color=color, alpha=0.15)
+    for ax, ylabel in (
+        (ax_tp, "Output throughput (tokens / s)"),
+        (ax_kv, "KV utilization (live / allocated)"),
+    ):
+        ax.set_xscale("log", base=2)
+        ax.set_xlabel("Block size (tokens)")
+        ax.set_ylabel(ylabel)
+        ax.grid(visible=True, linestyle="--", alpha=0.4)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend()
+    fig.suptitle(f"Block-size sweep\n{hw_label}")
+    fig.tight_layout()
+    dest = out_dir / "block_size_sweep.png"
+    fig.savefig(dest, dpi=150)
+    plt.close(fig)
+    print(f"[block-size] wrote {dest}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Chart 7 — preemption policy comparison (Phase 8 B3)
+# ---------------------------------------------------------------------------
+
+
+def plot_preemption_policies(
+    records: list[RunRecord],
+    out_dir: Path,
+    hw_label: str,
+) -> bool:
+    """Throughput vs concurrency, one line per preemption policy.
+
+    Only runs that actually preempted are informative; the chart needs both
+    policies present with a nonzero preemption count somewhere.
+    """
+    usable = [
+        r
+        for r in records
+        if r.preemption_policy is not None
+        and r.concurrency is not None
+        and r.output_throughput is not None
+        and r.arm == "ps-continuous"
+    ]
+    policies = {r.preemption_policy for r in usable}
+    if not {"recompute", "swap"} <= policies or not any((r.preemptions or 0) > 0 for r in usable):
+        print(
+            f"[preemption] skipping '{hw_label}': need recompute and swap runs "
+            "with at least one preemption"
+        )
+        return False
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for policy, color in (("recompute", "#8c564b"), ("swap", "#17becf")):
+        data: dict[float, list[float]] = {}
+        for r in usable:
+            if r.preemption_policy == policy:
+                data.setdefault(float(r.concurrency), []).append(r.output_throughput)
+        xs, meds, lo, hi = _median_band(data)
+        ax.plot(xs, meds, marker="o", color=color, label=policy)
+        if len(xs) > 1:
+            ax.fill_between(xs, lo, hi, color=color, alpha=0.15)
+    ax.set_xlabel("Concurrency (in-flight requests)")
+    ax.set_ylabel("Output throughput (tokens / s)")
+    ax.set_title(f"Preemption policy: recompute vs swap\n{hw_label}")
+    ax.legend()
+    ax.grid(visible=True, linestyle="--", alpha=0.4)
+    fig.tight_layout()
+    dest = out_dir / "preemption_policies.png"
+    fig.savefig(dest, dpi=150)
+    plt.close(fig)
+    print(f"[preemption] wrote {dest}")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
 
 def _load_records(results_dir: Path) -> list[RunRecord]:
-    paths = sorted(results_dir.glob("*.json"))
+    # rglob, so a sweep's per-arm subdirectories are picked up too.
+    paths = sorted(results_dir.rglob("*.json"))
     if not paths:
         logger.warning("no *.json files found in %s", results_dir)
     records = []
@@ -595,6 +719,8 @@ def run(results_dir: Path, out_dir: Path) -> None:
         plot_itl_vs_concurrency(grp, grp_out, hw_label)
         plot_ttft_vs_prefix_fraction(grp, grp_out, hw_label)
         plot_kv_utilization(grp, grp_out, hw_label)
+        plot_vs_block_size(grp, grp_out, hw_label)
+        plot_preemption_policies(grp, grp_out, hw_label)
 
 
 def main(argv: list[str] | None = None) -> int:

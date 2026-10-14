@@ -492,3 +492,71 @@ def test_multiple_hardware_contexts_produce_separate_dirs(tmp_path: Path) -> Non
     run(rdir, out)
     subdirs = list(out.iterdir())
     assert len(subdirs) == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 charts: block-size sweep and preemption policies
+# ---------------------------------------------------------------------------
+
+
+def _with_engine(data: dict, *, block_size: int, policy: str = "recompute", preemptions=0):
+    data["config"]["engine"].update(
+        {"cache": {"block_size": block_size}, "scheduler": {"preemption_policy": policy}}
+    )
+    data["workload"]["scheduler"] = {"steps": 100, "preemptions": preemptions}
+    return data
+
+
+def test_parse_result_reads_block_size_and_policy(tmp_path: Path) -> None:
+    data = _with_engine(_make_result(arm="ps-continuous"), block_size=32, policy="swap")
+    data["workload"]["scheduler"]["preemptions"] = 7
+    rec = _parse_result(_write(tmp_path, "r.json", data))
+    assert rec is not None
+    assert (rec.block_size, rec.preemption_policy, rec.preemptions) == (32, "swap", 7)
+
+
+def test_block_size_chart_produced(tmp_path: Path) -> None:
+    rdir = tmp_path / "results" / "block_size"
+    rdir.mkdir(parents=True)
+    for b in (8, 16, 32):
+        data = _make_result(arm="ps-continuous", kv_utilization=0.9, output_throughput=100.0 * b)
+        _write(rdir, f"b{b}.json", _with_engine(data, block_size=b))
+    out = tmp_path / "out"
+    run(tmp_path / "results", out)
+    assert (_chart_dir(out) / "block_size_sweep.png").exists()
+
+
+def test_block_size_chart_needs_two_sizes(tmp_path: Path) -> None:
+    rdir = tmp_path / "results"
+    rdir.mkdir()
+    _write(rdir, "b16.json", _with_engine(_make_result(arm="ps-continuous"), block_size=16))
+    out = tmp_path / "out"
+    run(rdir, out)
+    assert not (_chart_dir(out) / "block_size_sweep.png").exists()
+
+
+def test_preemption_chart_produced(tmp_path: Path) -> None:
+    rdir = tmp_path / "results"
+    rdir.mkdir()
+    for policy in ("recompute", "swap"):
+        for c in (4, 16):
+            data = _make_result(arm="ps-continuous", concurrency=c)
+            _write(
+                rdir,
+                f"{policy}{c}.json",
+                _with_engine(data, block_size=16, policy=policy, preemptions=c),
+            )
+    out = tmp_path / "out"
+    run(rdir, out)
+    assert (_chart_dir(out) / "preemption_policies.png").exists()
+
+
+def test_preemption_chart_skipped_without_preemptions(tmp_path: Path) -> None:
+    rdir = tmp_path / "results"
+    rdir.mkdir()
+    for policy in ("recompute", "swap"):
+        data = _make_result(arm="ps-continuous")
+        _write(rdir, f"{policy}.json", _with_engine(data, block_size=16, policy=policy))
+    out = tmp_path / "out"
+    run(rdir, out)
+    assert not (_chart_dir(out) / "preemption_policies.png").exists()

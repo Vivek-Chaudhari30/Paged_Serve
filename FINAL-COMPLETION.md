@@ -94,12 +94,12 @@ from the two machines into one chart (§4, rule R3).
 | **1** — Naive engine | Own Llama forward pass, contiguous KV cache | ✅ Done | ✅ Utilization measured (2.1%) | **Complete** |
 | **2** — Paged KV cache | Fixed-size blocks + block tables, Python `gather` read path | ✅ Done | ⚠️ Utilization measured; throughput not | **Blocked on GPU** |
 | **3** — Continuous batching | Iteration-level scheduler, admission, preemption (recompute + swap) | ✅ Done | ❌ No concurrency sweep | **Blocked on GPU** |
-| **4** — CUDA paged attention | Hand-written GPU kernel that reads KV through block tables | ⚠️ **Scaffolding only** | ❌ Nothing | **~10% — the long pole** |
+| **4** — CUDA paged attention | Hand-written GPU kernel that reads KV through block tables | ✅ Written (K1–K4); CPU-tested via reference ops | ❌ Not compiled / run on GPU | **Blocked on GPU** |
 | **5** — Prefix caching | Shared, refcounted, LRU-evicted KV blocks for common prompt prefixes | ✅ Done | ⚠️ 78.9% hit rate on CPU; no TTFT number | **Blocked on GPU** |
 | **6** — HTTP server | OpenAI-compatible FastAPI + SSE streaming, full sampling | ✅ Done | ❌ No sweep through the HTTP path | **Blocked on GPU** |
-| **7** — Chunked prefill & polish | Split long prompts across steps; CUDA graphs; kill host-device syncs | ❌ Not started | — | **Not started** |
-| **8** — Ablations | Prove *which* change caused *which* gain. Compare honestly to vLLM. | ❌ Not started | — | **Not started — never cut this** |
-| **9** — Writeup | README, design doc, resume truth-up with real numbers | ❌ Not started | — | **Not started** |
+| **7** — Chunked prefill & polish | Split long prompts across steps; CUDA graphs; kill host-device syncs | ✅ Done (Q1, Q2, Q4; Q3 down to one sync/step) | ⚠️ Chunked prefill golden-verified on CPU; graphs GPU-unverified | **Blocked on GPU** |
+| **8** — Ablations | Prove *which* change caused *which* gain. Compare honestly to vLLM. | ✅ Tooling (B1, B7, `bench/sweep.py`) | ❌ No sweep | **Blocked on GPU** |
+| **9** — Writeup | README, design doc, resume truth-up with real numbers | ⚠️ W2, W3, W4, W6 written | ❌ Needs results | **Blocked on GPU** |
 
 ### 1.3 What has been proven on a real GPU (Tesla T4, float16)
 
@@ -251,12 +251,12 @@ Grouped by where it runs. Nothing here is optional except where marked.
 
 ### 3.4 Phase 4 — the CUDA decode kernel (AWS, ~3 weeks, ~$40 — the long pole)
 
-- [ ] **K1 — `csrc/paged_attention.cu` v1.** One thread block per `(sequence, head)`. Read
+- [x] **K1 — `csrc/paged_attention.cu` v1.** One thread block per `(sequence, head)`. Read
       the block table. Online softmax. **No optimization at all.** Correct and slow.
-- [ ] **K2 — `csrc/cache_kernels.cu`** — KV scatter/copy/swap kernels.
-- [ ] **K3 — `pagedserve/attention/cuda_paged.py`** — the Python wrapper; wire up
+- [x] **K2 — `csrc/cache_kernels.cu`** — KV scatter/copy/swap kernels.
+- [x] **K3 — `pagedserve/attention/cuda_paged.py`** — the Python wrapper; wire up
       `attn_backend="cuda"` in config.
-- [ ] **K4 — `tests/test_attention_parity.py`** — diff the CUDA kernel against
+- [x] **K4 — `tests/test_attention_cuda.py`** (CPU half done; GPU half is `-m gpu`) — diff the CUDA kernel against
       `attention/gather.py` on random inputs at `atol=1e-2`.
       *Why: `gather.py` is the correctness oracle. It exists forever for exactly this.*
 - [ ] **K5 — Golden test must pass on the `cuda` backend**, same as on `gather`.
@@ -269,16 +269,16 @@ Grouped by where it runs. Nothing here is optional except where marked.
 
 ### 3.5 Phase 7 — polish (~1.5 weeks — cut this first if time runs short)
 
-- [ ] **Q1 — Chunked prefill**, behind a flag, with a per-step token budget.
-- [ ] **Q2 — CUDA graphs on the decode path**, with bucketed batch sizes.
-- [ ] **Q3 — Eliminate host-device syncs** in the loop (`.item()`, `.cpu()`, `.tolist()`).
+- [x] **Q1 — Chunked prefill**, behind a flag, with a per-step token budget.
+- [x] **Q2 — CUDA graphs on the decode path**, with bucketed batch sizes.
+- [x] **Q3 — Eliminate host-device syncs** (one deliberate `.tolist()` per step remains) in the loop (`.item()`, `.cpu()`, `.tolist()`).
       *Why: this is the single most common performance bug in hand-rolled inference loops.
       Finding one in your own code with a profiler is a genuinely good interview story.*
-- [ ] **Q4 — Async detokenization** on a separate thread.
+- [x] **Q4 — Async detokenization** on a separate thread.
 
 ### 3.6 Phase 8 — ablations (~1 week — **never cut this**)
 
-- [ ] **B1 — Make `--no-paging` and `--static-batching` first-class engine/server CLI flags.**
+- [x] **B1 — Make `--no-paging` and `--static-batching` first-class engine/server CLI flags.**
       (Today they exist only in `bench/loadgen.py`.)
 - [ ] **B2 — Block-size sweep: 1, 8, 16, 32, 64, 128.** Chart utilization, throughput, kernel time.
       *Why: it turns "block size 16" from a number you copied into a number you measured.*
@@ -291,16 +291,16 @@ Grouped by where it runs. Nothing here is optional except where marked.
       and CUDA graph coverage — here's my profile" is exactly the judgment they screen for.
       Claiming to beat vLLM would get you disbelieved, correctly.*
 - [ ] **B6 — Scale check:** rerun the headline benchmark once on a 7–8B model.
-- [ ] **B7 — New chart functions in `bench/plot.py`** for B2, B3, B5.
+- [x] **B7 — New chart functions in `bench/plot.py`** for B2, B3, B5.
 
 ### 3.7 Phase 9 — writeup (~1 week)
 
 - [ ] **W1 — README:** what/why → headline chart → architecture diagram → design decisions
       with rationale → **benchmark methodology** → results with ablations → honest
       limitations → what's next.
-- [ ] **W2 — `docs/design.md`** (a trimmed, public version of `_private/DESIGN.md`).
-- [ ] **W3 — One script that regenerates every chart** from committed results.
-- [ ] **W4 — Written vLLM gap analysis.**
+- [x] **W2 — `docs/design.md`** (a trimmed, public version of `_private/DESIGN.md`).
+- [x] **W3 — One script that regenerates every chart** from committed results.
+- [x] **W4 — Written vLLM gap analysis.**
 - [ ] **W5 — Resume truth-up.** Your resume currently claims 3.4× sequences, 6.8×
       throughput, 61% P99 TTFT. **Those came from literature calibration, not measurement,
       and they are already out at NVIDIA and other companies.** Replace them with whatever
@@ -308,7 +308,7 @@ Grouped by where it runs. Nothing here is optional except where marked.
       the hardware, model, dataset and protocol without hesitating, and hold up under
       questioning. Someone who has built serving infrastructure finds an invented number
       in about two questions.
-- [ ] **W6 — Write out your interview answers:** why paging; why block size 16; why decode
+- [x] **W6 — Write out your interview answers:** why paging; why block size 16; why decode
       is memory-bound; why continuous batching *requires* paging; where you are slower than
       vLLM and why; what you would do next.
 
