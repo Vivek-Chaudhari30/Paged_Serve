@@ -137,7 +137,7 @@ It prints the plan and the hourly cost, then waits for you to type `LAUNCH`. Wha
 
 1. Resolves the current **Deep Learning AMI (Ubuntu)** — it ships NVIDIA drivers, CUDA and
    PyTorch already installed. Building that stack yourself burns an hour of paid GPU time.
-2. Launches one `g5.xlarge` with a 60 GB gp3 root volume, shutdown behaviour **terminate**,
+2. Launches one `g5.xlarge` with a 100 GB gp3 root volume (the AMI snapshot alone is 75 GB), shutdown behaviour **terminate**,
    and a `shutdown -h +540` dead-man's switch in its user-data. The switch runs before any
    of our code, so a failure in our code cannot leave the box alive.
 3. Waits for SSH, clones the branch, installs, and builds the CUDA extension **explicitly**:
@@ -230,3 +230,13 @@ and `--teardown-only` paths have been walked end to end on a laptop.
 **The live path has never been executed.** No AWS account has run it, because the GPU quota
 has not been granted yet. Read the `--dry-run` output before the first real launch, and
 watch the first run rather than leaving it unattended.
+
+---
+
+## 10. Free plan accounts cannot launch GPU instances
+
+Verified 2026-10-14: on the AWS **Free plan**, `RunInstances` for `g5.xlarge` fails with
+`InvalidParameterCombination: ... not eligible for Free Tier`, even after a GPU vCPU quota
+increase is approved. Only CPU types (t3/t4g/c7i-flex/m7i-flex/t8i) are eligible. Running
+this script requires upgrading to the Paid plan (credits still apply). Without that, use
+Explorer or Kaggle (`scripts/kaggle_bootstrap.sh`); see `results/verification/`.

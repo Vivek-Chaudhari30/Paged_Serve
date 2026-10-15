@@ -38,7 +38,7 @@
 # Optional:
 #   AWS_REGION         default us-east-1
 #   INSTANCE_TYPE      default g5.xlarge
-#   VOLUME_GB          default 60
+#   VOLUME_GB          default 100
 #   REPO_URL           default the public GitHub repo
 #   DLAMI_SSM_PARAM    SSM path to the Deep Learning AMI id
 #   SWEEP_ENV          extra env passed to the sweep, e.g. "SECTIONS=baselines"
@@ -53,7 +53,7 @@ set -euo pipefail
 
 AWS_REGION="${AWS_REGION:-us-east-1}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-g5.xlarge}"
-VOLUME_GB="${VOLUME_GB:-60}"
+VOLUME_GB="${VOLUME_GB:-100}"
 REPO_URL="${REPO_URL:-https://github.com/Vivek-Chaudhari30/Paged_Serve.git}"
 SSH_USER="${SSH_USER:-ubuntu}"
 # Resolved through SSM rather than pinned: AMI ids are per-region and change
@@ -118,7 +118,7 @@ Required environment:
   AWS_SECURITY_GROUP  security group id (SSH from your IP only)
 
 Optional:
-  AWS_REGION (us-east-1)  INSTANCE_TYPE (g5.xlarge)  VOLUME_GB (60)
+  AWS_REGION (us-east-1)  INSTANCE_TYPE (g5.xlarge)  VOLUME_GB (100)
   NUM_BLOCKS              KV blocks for the sweep; see the comment in this file
   SWEEP_ENV               extra env for the sweep, e.g. "SECTIONS=baselines"
   PUSH_RESULTS=1          also git push a results branch from the box

@@ -1,0 +1,265 @@
+==> environment
+Thu Oct 15 03:09:02 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.178.04             Driver Version: 580.178.04     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  Tesla T4                       Off |   00000000:00:04.0 Off |                    0 |
+| N/A   48C    P8             12W /   70W |       0MiB /  15360MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  Tesla T4                       Off |   00000000:00:05.0 Off |                    0 |
+| N/A   51C    P8             12W /   70W |       0MiB /  15360MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+Python 3.13.15
+==> checkout
+Cloning into '/kaggle/working/Paged_Serve'...
+checked out main at a7244ef
+==> install
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10.4/10.4 MB 57.5 MB/s eta 0:00:00
+==> verify
+torch      2.11.0+cu128
+cuda       12.8
+gpu        Tesla T4
+compute    7.5
+bf16 native False
+bf16 reported True
+pagedserve 0.0.0
+transformers 5.16.1
+........................................................................ [ 14%]
+........................................................................ [ 28%]
+........................................................................ [ 42%]
+........................................................................ [ 56%]
+........................................................................ [ 70%]
+........................................................................ [ 84%]
+........................................................................ [ 98%]
+......                                                                   [100%]
+=============================== warnings summary ===============================
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:64
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:64: PyparsingDeprecationWarning: 'oneOf' deprecated - use 'one_of'
+    prop = Group((name + Suppress("=") + comma_separated(value)) | oneOf(_CONSTANTS))
+
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:85: 6 warnings
+tests/test_plot.py: 25 warnings
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:85: PyparsingDeprecationWarning: 'parseString' deprecated - use 'parse_string'
+    parse = parser.parseString(pattern)
+
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:89: 6 warnings
+tests/test_plot.py: 25 warnings
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:89: PyparsingDeprecationWarning: 'resetCache' deprecated - use 'reset_cache'
+    parser.resetCache()
+
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:45
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:45: PyparsingDeprecationWarning: 'enablePackrat' deprecated - use 'enable_packrat'
+    ParserElement.enablePackrat()
+
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2010: PyparsingDeprecationWarning: 'oneOf' deprecated - use 'one_of'
+    p.space          = oneOf(self._space_widths)("space")
+
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2012: PyparsingDeprecationWarning: 'oneOf' deprecated - use 'one_of'
+    p.style_literal  = oneOf(
+
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2020: PyparsingDeprecationWarning: 'leaveWhitespace' deprecated - use 'leave_whitespace'
+    )("sym").leaveWhitespace()
+
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2024: PyparsingDeprecationWarning: 'oneOf' deprecated - use 'one_of'
+    p.start_group    = Optional(r"\math" + oneOf(self._fontnames)("font")) + "{"
+
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2027: PyparsingDeprecationWarning: 'oneOf' deprecated - use 'one_of'
+    p.delim          = oneOf(self._delims)
+
+tests/test_plot.py: 47 warnings
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:1984: PyparsingDeprecationWarning: 'setName' deprecated - use 'set_name'
+    val.setName(key)
+
+tests/test_plot.py: 44 warnings
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:1987: PyparsingDeprecationWarning: 'setParseAction' deprecated - use 'set_parse_action'
+    val.setParseAction(getattr(self, key))
+
+tests/test_plot.py: 16 warnings
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:1748: PyparsingDeprecationWarning: 'setParseAction' deprecated - use 'set_parse_action'
+    return Empty().setParseAction(raise_error)
+
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2088: PyparsingDeprecationWarning: 'endQuoteChar' argument is deprecated, use 'end_quote_char'
+    p.text = cmd(r"\text", QuotedString('{', '\\', endQuoteChar="}"))
+
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2097: PyparsingDeprecationWarning: 'oneOf' deprecated - use 'one_of'
+    + OneOrMore(oneOf(["_", "^"]) - p.placeable)("subsuper")
+
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2146: PyparsingDeprecationWarning: 'unquoteResults' argument is deprecated, use 'unquote_results'
+    p.math_string   = QuotedString('$', '\\', unquoteResults=False)
+
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2147: PyparsingDeprecationWarning: 'leaveWhitespace' deprecated - use 'leave_whitespace'
+    p.non_math      = Regex(r"(?:(?:\\[$])|[^$])*").leaveWhitespace()
+
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2170: PyparsingDeprecationWarning: 'parseString' deprecated - use 'parse_string'
+    result = self._expression.parseString(s)
+
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2197: PyparsingDeprecationWarning: 'parseString' deprecated - use 'parse_string'
+    return self._math_expression.parseString(toks[0][1:-1], parseAll=True)
+
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/pyparsing/util.py:466: PyparsingDeprecationWarning: 'parseAll' argument is deprecated, use 'parse_all'
+    return fn(self, *args, **kwargs)
+
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2178: PyparsingDeprecationWarning: 'resetCache' deprecated - use 'reset_cache'
+    ParserElement.resetCache()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+510 passed, 64 deselected, 204 warnings in 398.56s (0:06:38)
+==> build the CUDA extension
+Building the CUDA extension against /usr/local/cuda
+running build_ext
+building 'pagedserve._C' extension
+creating /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc
+[1/4] c++ -MMD -MF /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/bindings.o.d -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -g -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -g -fwrapv -O2 -fPIC -I/usr/local/lib/python3.13/dist-packages/torch/include -I/usr/local/lib/python3.13/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.13 -c -c /kaggle/working/Paged_Serve/csrc/bindings.cpp -o /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/bindings.o -O3 -std=c++17 -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C
+[2/4] /usr/local/cuda/bin/nvcc -MD -MF /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/trivial.o.d -I/usr/local/lib/python3.13/dist-packages/torch/include -I/usr/local/lib/python3.13/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.13 -c -c /kaggle/working/Paged_Serve/csrc/trivial.cu -o /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/trivial.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 --expt-relaxed-constexpr -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_75,code=sm_75
+[3/4] /usr/local/cuda/bin/nvcc -MD -MF /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/paged_attention.o.d -I/usr/local/lib/python3.13/dist-packages/torch/include -I/usr/local/lib/python3.13/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.13 -c -c /kaggle/working/Paged_Serve/csrc/paged_attention.cu -o /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/paged_attention.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 --expt-relaxed-constexpr -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_75,code=sm_75
+[4/4] /usr/local/cuda/bin/nvcc -MD -MF /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/cache_kernels.o.d -I/usr/local/lib/python3.13/dist-packages/torch/include -I/usr/local/lib/python3.13/dist-packages/torch/include/torch/csrc/api/include -I/usr/local/cuda/include -I/usr/include/python3.13 -c -c /kaggle/working/Paged_Serve/csrc/cache_kernels.cu -o /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/cache_kernels.o -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -O3 -std=c++17 --expt-relaxed-constexpr -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=_C -gencode=arch=compute_75,code=compute_75 -gencode=arch=compute_75,code=sm_75
+creating build/lib.linux-x86_64-cpython-313/pagedserve
+x86_64-linux-gnu-g++ -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -g -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -g -fwrapv -O2 -shared -Wl,-O1 -Wl,-Bsymbolic-functions -Wl,-Bsymbolic-functions -g -fwrapv -O2 /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/bindings.o /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/cache_kernels.o /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/paged_attention.o /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/trivial.o -L/usr/local/lib/python3.13/dist-packages/torch/lib -L/usr/local/cuda/lib64 -L/usr/lib/x86_64-linux-gnu -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-cpython-313/pagedserve/_C.cpython-313-x86_64-linux-gnu.so
+copying build/lib.linux-x86_64-cpython-313/pagedserve/_C.cpython-313-x86_64-linux-gnu.so -> pagedserve
+extension importable: True
+.......                                                                  [100%]
+7 passed, 6 deselected in 2.57s
+==> GPU smoke checks (the CUDA paths that have never run)
+========================================================================
+  ENVIRONMENT
+========================================================================
+  torch            2.11.0+cu128
+  cuda runtime     12.8
+  cuda available   True
+  gpu              Tesla T4
+  compute cap      7.5
+  total memory     14.6 GiB
+  bf16 supported   True
+  resolved device  cuda
+  resolved dtype   torch.float16
+  transformers     5.16.1
+
+========================================================================
+  CHECKS
+========================================================================
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 1479.85it/s]
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 1410.73it/s]
+sizing the KV cache without a profiling forward pass: activation memory is being counted as zero, so this estimate is optimistic. Set CacheConfig.num_blocks_override for a run that must not OOM.
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 1437.74it/s]
+sizing the KV cache without a profiling forward pass: activation memory is being counted as zero, so this estimate is optimistic. Set CacheConfig.num_blocks_override for a run that must not OOM.
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 1300.16it/s]
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 1488.17it/s]
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 1319.26it/s]
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 1146.43it/s]
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 1403.98it/s]
+Fetching 7 files:   0%|          | 0/7 [00:00<?, ?it/s]Fetching 7 files: 100%|██████████| 7/7 [00:00<00:00, 1316.36it/s]
+
+========================================================================
+  SUMMARY
+========================================================================
+  [PASS] profile_num_blocks measures free memory
+         66508 blocks x 16 tokens = 1,064,128 token slots
+  [PASS] SwapSpace round-trips blocks through pinned host memory
+         pinned=True, 2 blocks out and back
+  [PASS] end-to-end generation in torch.float16
+         ' Paris. It is the largest city in Europe' | ' \n    return a + b \n\ndef subtract(a, b):'
+  [PASS] contiguous (--no-paging) arm runs on GPU
+         KV cache: 24.0 MiB allocated, 0.1 MiB live, 23.9 MiB wasted (0.6% utilization)
+  [PASS] paged and contiguous agree bit-for-bit on GPU
+         identical
+  [PASS] forced preemption is invisible in the output (both policies)
+         recompute=1 preemptions, swap=1 preemptions
+
+  6 passed, 0 failed
+
+  Reminder: these are correctness checks, not benchmarks. A notebook
+  GPU is shared and unpinnable, so nothing timed here belongs in results/.
+==> golden test on GPU, in this device's native dtype
+    using dtype float16
+..........................................................               [100%]
+58 passed in 68.74s (0:01:08)
+==> smoke run (mock backend, proves the harness works here)
+{
+  "units": "seconds",
+  "num_requests": 32,
+  "num_succeeded": 32,
+  "num_failed": 0,
+  "total_prompt_tokens": null,
+  "total_output_tokens": 512,
+  "duration": 0.11069864700004928,
+  "ttft_p50": 0.010234157500008223,
+  "ttft_p95": 0.01030041859999642,
+  "ttft_p99": 0.010302003679980772,
+  "ttft_mean": 0.010239029718754011,
+  "itl_p50": 0.0011653505000595032,
+  "itl_p95": 0.00120730749998188,
+  "itl_p99": 0.0012334312800601308,
+  "itl_mean": 0.0011607646645837614,
+  "tpot_p50": 0.0011591913333366696,
+  "tpot_p95": 0.0011878026766661757,
+  "tpot_p99": 0.001188277196667438,
+  "tpot_mean": 0.0011607646645837616,
+  "e2e_p50": 0.027653912499999933,
+  "e2e_p95": 0.02805251965000366,
+  "e2e_p99": 0.02805840037998564,
+  "e2e_mean": 0.027650499687510433,
+  "output_throughput": 4625.16944764259,
+  "prompt_throughput": null,
+  "request_throughput": 289.0730904776619,
+  "slo": null,
+  "num_good": null,
+  "goodput": null
+}
+
+==> ready.
+
+Next, against a real model:
+  python bench/loadgen.py --backend hf --model <model-id> \
+      --baseline-mode static --mode closed --concurrency 32 \
+      --num-requests 256 --max-tokens 128 \
+      --output results/scratch/kaggle-smoke.json
+
+Note the results/scratch/ path: it is gitignored. Notebook timings are smoke
+tests, not evidence, and must not land in results/ alongside real measurements.

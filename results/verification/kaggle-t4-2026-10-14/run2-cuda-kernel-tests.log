@@ -1,0 +1,247 @@
+0.00s - Debugger warning: It seems that frozen modules are being used, which may
+0.00s - make the debugger miss breakpoints. Please pass -Xfrozen_modules=off
+0.00s - to python to disable frozen modules.
+0.00s - Note: Debugging will proceed. Set PYDEVD_DISABLE_FILE_VALIDATION=1 to disable this validation.
+0.00s - Debugger warning: It seems that frozen modules are being used, which may
+0.00s - make the debugger miss breakpoints. Please pass -Xfrozen_modules=off
+0.00s - to python to disable frozen modules.
+0.00s - Note: Debugging will proceed. Set PYDEVD_DISABLE_FILE_VALIDATION=1 to disable this validation.
+a7244ef
+Tesla T4, 580.178.04
+Tesla T4, 580.178.04
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10.4/10.4 MB 45.1 MB/s eta 0:00:00
+creating build/lib.linux-x86_64-cpython-313/pagedserve
+x86_64-linux-gnu-g++ -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -g -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection -g -fwrapv -O2 -shared -Wl,-O1 -Wl,-Bsymbolic-functions -Wl,-Bsymbolic-functions -g -fwrapv -O2 /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/bindings.o /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/cache_kernels.o /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/paged_attention.o /kaggle/working/Paged_Serve/build/temp.linux-x86_64-cpython-313/csrc/trivial.o -L/usr/local/lib/python3.13/dist-packages/torch/lib -L/usr/local/cuda/lib64 -L/usr/lib/x86_64-linux-gnu -lc10 -ltorch -ltorch_cpu -ltorch_python -lcudart -lc10_cuda -ltorch_cuda -o build/lib.linux-x86_64-cpython-313/pagedserve/_C.cpython-313-x86_64-linux-gnu.so
+copying build/lib.linux-x86_64-cpython-313/pagedserve/_C.cpython-313-x86_64-linux-gnu.so -> pagedserve
+ext True
+=== A: pytest -m gpu ===
+....................................................ssssssssssss         [100%]
+=============================== warnings summary ===============================
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:64
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:64: PyparsingDeprecationWarning: 'oneOf' deprecated - use 'one_of'
+    prop = Group((name + Suppress("=") + comma_separated(value)) | oneOf(_CONSTANTS))
+
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:85
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:85
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:85
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:85
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:85
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:85
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:85: PyparsingDeprecationWarning: 'parseString' deprecated - use 'parse_string'
+    parse = parser.parseString(pattern)
+
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:89
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:89
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:89
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:89
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:89
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:89
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_fontconfig_pattern.py:89: PyparsingDeprecationWarning: 'resetCache' deprecated - use 'reset_cache'
+    parser.resetCache()
+
+../../../usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:45
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:45: PyparsingDeprecationWarning: 'enablePackrat' deprecated - use 'enable_packrat'
+    ParserElement.enablePackrat()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_golden.py:201: cuda backend needs PAGEDSERVE_TEST_DEVICE=cuda and the built extension
+SKIPPED [4] tests/test_golden.py:215: cuda backend needs PAGEDSERVE_TEST_DEVICE=cuda and the built extension
+SKIPPED [1] tests/test_golden.py:223: cuda backend needs PAGEDSERVE_TEST_DEVICE=cuda and the built extension
+SKIPPED [1] tests/test_golden.py:238: cuda backend needs PAGEDSERVE_TEST_DEVICE=cuda and the built extension
+SKIPPED [1] tests/test_golden.py:243: cuda backend needs PAGEDSERVE_TEST_DEVICE=cuda and the built extension
+SKIPPED [1] tests/test_golden.py:252: cuda backend needs PAGEDSERVE_TEST_DEVICE=cuda and the built extension
+SKIPPED [1] tests/test_golden.py:260: cuda backend needs PAGEDSERVE_TEST_DEVICE=cuda and the built extension
+SKIPPED [1] tests/test_golden.py:264: cuda backend needs PAGEDSERVE_TEST_DEVICE=cuda and the built extension
+SKIPPED [1] tests/test_golden.py:269: cuda backend needs PAGEDSERVE_TEST_DEVICE=cuda and the built extension
+52 passed, 12 skipped, 510 deselected, 14 warnings in 35.37s
+=== B: cuda kernel + graph + extension tests, device=cuda fp16 ===
+..............s......................................................... [ 97%]
+..                                                                       [100%]
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_attention_cuda.py:253: extension is built here
+73 passed, 1 skipped in 5.84s
+=== C: golden suite device=cuda fp16 (verbose, shows backend params + skips) ===
+============================= test session starts ==============================
+platform linux -- Python 3.13.15, pytest-8.4.2, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+pagedserve: torch=2.11.0+cu128 cuda=Tesla T4 extension=True
+pagedserve: golden gate device=cuda dtype=float16 model=Qwen/Qwen2.5-0.5B-Instruct (loadable)
+rootdir: /kaggle/working/Paged_Serve
+configfile: pyproject.toml
+plugins: typeguard-4.6.0, anyio-4.14.2, langsmith-0.12.1
+collecting ... collected 58 items
+
+tests/test_golden.py::TestGoldenOutput::test_batched_greedy_matches_huggingface[contiguous] PASSED [  1%]
+tests/test_golden.py::TestGoldenOutput::test_each_prompt_alone_matches_huggingface[contiguous-0] PASSED [  3%]
+tests/test_golden.py::TestGoldenOutput::test_each_prompt_alone_matches_huggingface[contiguous-1] PASSED [  5%]
+tests/test_golden.py::TestGoldenOutput::test_each_prompt_alone_matches_huggingface[contiguous-2] PASSED [  6%]
+tests/test_golden.py::TestGoldenOutput::test_each_prompt_alone_matches_huggingface[contiguous-3] PASSED [  8%]
+tests/test_golden.py::TestGoldenOutput::test_batching_does_not_change_a_sequence_output[contiguous] PASSED [ 10%]
+tests/test_golden.py::TestGenerationMechanics::test_respects_max_tokens[contiguous] PASSED [ 12%]
+tests/test_golden.py::TestGenerationMechanics::test_stops_on_eos[contiguous] PASSED [ 13%]
+tests/test_golden.py::TestGenerationMechanics::test_forced_stop_token_terminates_immediately[contiguous] PASSED [ 15%]
+tests/test_golden.py::TestGenerationMechanics::test_empty_batch[contiguous] PASSED [ 17%]
+tests/test_golden.py::TestGenerationMechanics::test_rejects_a_prompt_longer_than_the_cache[contiguous] PASSED [ 18%]
+tests/test_golden.py::TestGenerationMechanics::test_rejects_a_batch_wider_than_the_cache[contiguous] PASSED [ 20%]
+tests/test_golden.py::TestGoldenOutput::test_batched_greedy_matches_huggingface[gather] PASSED [ 22%]
+tests/test_golden.py::TestGoldenOutput::test_each_prompt_alone_matches_huggingface[gather-0] PASSED [ 24%]
+tests/test_golden.py::TestGoldenOutput::test_each_prompt_alone_matches_huggingface[gather-1] PASSED [ 25%]
+tests/test_golden.py::TestGoldenOutput::test_each_prompt_alone_matches_huggingface[gather-2] PASSED [ 27%]
+tests/test_golden.py::TestGoldenOutput::test_each_prompt_alone_matches_huggingface[gather-3] PASSED [ 29%]
+tests/test_golden.py::TestGoldenOutput::test_batching_does_not_change_a_sequence_output[gather] PASSED [ 31%]
+tests/test_golden.py::TestGenerationMechanics::test_respects_max_tokens[gather] PASSED [ 32%]
+tests/test_golden.py::TestGenerationMechanics::test_stops_on_eos[gather] PASSED [ 34%]
+tests/test_golden.py::TestGenerationMechanics::test_forced_stop_token_terminates_immediately[gather] PASSED [ 36%]
+tests/test_golden.py::TestGenerationMechanics::test_empty_batch[gather] PASSED [ 37%]
+tests/test_golden.py::TestGenerationMechanics::test_rejects_a_prompt_longer_than_the_cache[gather] PASSED [ 39%]
+tests/test_golden.py::TestGenerationMechanics::test_rejects_a_batch_wider_than_the_cache[gather] PASSED [ 41%]
+tests/test_golden.py::TestGoldenOutput::test_batched_greedy_matches_huggingface[cuda] PASSED [ 43%]
+tests/test_golden.py::TestGoldenOutput::test_each_prompt_alone_matches_huggingface[cuda-0] PASSED [ 44%]
+tests/test_golden.py::TestGoldenOutput::test_each_prompt_alone_matches_huggingface[cuda-1] PASSED [ 46%]
+tests/test_golden.py::TestGoldenOutput::test_each_prompt_alone_matches_huggingface[cuda-2] PASSED [ 48%]
+tests/test_golden.py::TestGoldenOutput::test_each_prompt_alone_matches_huggingface[cuda-3] PASSED [ 50%]
+tests/test_golden.py::TestGoldenOutput::test_batching_does_not_change_a_sequence_output[cuda] PASSED [ 51%]
+tests/test_golden.py::TestGenerationMechanics::test_respects_max_tokens[cuda] PASSED [ 53%]
+tests/test_golden.py::TestGenerationMechanics::test_stops_on_eos[cuda] PASSED [ 55%]
+tests/test_golden.py::TestGenerationMechanics::test_forced_stop_token_terminates_immediately[cuda] PASSED [ 56%]
+tests/test_golden.py::TestGenerationMechanics::test_empty_batch[cuda] PASSED [ 58%]
+tests/test_golden.py::TestGenerationMechanics::test_rejects_a_prompt_longer_than_the_cache[cuda] PASSED [ 60%]
+tests/test_golden.py::TestGenerationMechanics::test_rejects_a_batch_wider_than_the_cache[cuda] PASSED [ 62%]
+tests/test_golden.py::TestPagedEquivalence::test_paged_and_dense_agree_bit_for_bit PASSED [ 63%]
+tests/test_golden.py::TestPagedEquivalence::test_paged_uses_far_less_memory_for_the_same_work PASSED [ 65%]
+tests/test_golden.py::TestPagedEquivalence::test_block_manager_returns_everything_between_runs PASSED [ 67%]
+tests/test_golden.py::TestPagedMemory::test_utilization_clears_the_phase_2_bar PASSED [ 68%]
+tests/test_golden.py::TestPagedMemory::test_never_exceeds_the_block_size_waste_bound PASSED [ 70%]
+tests/test_golden.py::TestMemoryInstrumentation::test_utilization_is_low_with_a_contiguous_cache PASSED [ 72%]
+tests/test_golden.py::TestMemoryInstrumentation::test_live_bytes_grow_as_tokens_are_generated PASSED [ 74%]
+tests/test_golden.py::TestMemoryInstrumentation::test_allocated_bytes_never_change_during_a_run PASSED [ 75%]
+tests/test_golden.py::TestMemoryInstrumentation::test_utilization_matches_the_hand_computation PASSED [ 77%]
+tests/test_golden.py::TestContinuousBatching::test_matches_static_batching PASSED [ 79%]
+tests/test_golden.py::TestContinuousBatching::test_mixed_batch_composition_is_reached PASSED [ 81%]
+tests/test_golden.py::TestContinuousBatching::test_a_request_added_mid_flight_still_matches PASSED [ 82%]
+tests/test_golden.py::TestContinuousBatching::test_forced_preemption_is_invisible_in_the_output[recompute] PASSED [ 84%]
+tests/test_golden.py::TestContinuousBatching::test_forced_preemption_is_invisible_in_the_output[swap] PASSED [ 86%]
+tests/test_golden.py::TestContinuousBatching::test_scheduling_variants_are_invisible_in_the_output[chunked-prefill] PASSED [ 87%]
+tests/test_golden.py::TestContinuousBatching::test_scheduling_variants_are_invisible_in_the_output[static-batching] PASSED [ 89%]
+tests/test_golden.py::TestContinuousBatching::test_blocks_are_all_returned_when_the_run_ends PASSED [ 91%]
+tests/test_golden.py::TestPrefixCaching::test_output_is_identical_with_caching_on_and_off PASSED [ 93%]
+tests/test_golden.py::TestPrefixCaching::test_the_cache_actually_hits_on_a_shared_prefix PASSED [ 94%]
+tests/test_golden.py::TestPrefixCaching::test_a_batch_admitted_together_still_produces_correct_output PASSED [ 96%]
+tests/test_golden.py::TestPrefixCaching::test_output_survives_eviction_under_memory_pressure PASSED [ 98%]
+tests/test_golden.py::TestPrefixCaching::test_no_blocks_leak_across_cached_runs PASSED [100%]
+
+======================== 58 passed in 75.18s (0:01:15) =========================
+=== D: whole suite device=cuda fp16 ===
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2170: PyparsingDeprecationWarning: 'parseString' deprecated - use 'parse_string'
+    result = self._expression.parseString(s)
+
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2197: PyparsingDeprecationWarning: 'parseString' deprecated - use 'parse_string'
+    return self._math_expression.parseString(toks[0][1:-1], parseAll=True)
+
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/pyparsing/util.py:466: PyparsingDeprecationWarning: 'parseAll' argument is deprecated, use 'parse_all'
+    return fn(self, *args, **kwargs)
+
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+tests/test_plot.py::test_block_size_chart_produced
+  /usr/local/lib/python3.13/dist-packages/matplotlib/_mathtext.py:2178: PyparsingDeprecationWarning: 'resetCache' deprecated - use 'reset_cache'
+    ParserElement.resetCache()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_attention_cuda.py:253: extension is built here
+515 passed, 1 skipped, 204 warnings in 78.53s (0:01:18)
+=== DONE ===
++ cd /kaggle/working
++ rm -rf Paged_Serve
++ git clone --depth 1 https://github.com/Vivek-Chaudhari30/Paged_Serve.git
+Cloning into 'Paged_Serve'...
++ cd Paged_Serve
++ git rev-parse --short HEAD
++ nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
++ pip install -q -e '.[baseline,dev]'
++ tail -2
++ python setup.py build_ext --inplace
++ tail -3
++ python -c 'from pagedserve.extension import is_available as a; print('\''ext'\'', a())'
++ echo '=== A: pytest -m gpu ==='
++ pytest -m gpu -q -rs
++ tail -40
++ echo '=== B: cuda kernel + graph + extension tests, device=cuda fp16 ==='
++ PAGEDSERVE_TEST_DEVICE=cuda
++ PAGEDSERVE_TEST_DTYPE=float16
++ pytest tests/test_attention_cuda.py tests/test_cuda_graph.py tests/test_extension.py -q -rs
++ tail -40
++ echo '=== C: golden suite device=cuda fp16 (verbose, shows backend params + skips) ==='
++ PAGEDSERVE_TEST_DEVICE=cuda
++ PAGEDSERVE_TEST_DTYPE=float16
++ pytest tests/test_golden.py -v -rs
++ tail -90
++ echo '=== D: whole suite device=cuda fp16 ==='
++ PAGEDSERVE_TEST_DEVICE=cuda
++ PAGEDSERVE_TEST_DTYPE=float16
++ pytest -q -rs --ignore=tests/test_golden.py
++ tail -40
++ echo '=== DONE ==='
+
++ cd /kaggle/working
++ rm -rf Paged_Serve
++ git clone --depth 1 https://github.com/Vivek-Chaudhari30/Paged_Serve.git
+Cloning into 'Paged_Serve'...
++ cd Paged_Serve
++ git rev-parse --short HEAD
++ nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
++ pip install -q -e '.[baseline,dev]'
++ tail -2
++ python setup.py build_ext --inplace
++ tail -3
++ python -c 'from pagedserve.extension import is_available as a; print('\''ext'\'', a())'
++ echo '=== A: pytest -m gpu ==='
++ pytest -m gpu -q -rs
++ tail -40
++ echo '=== B: cuda kernel + graph + extension tests, device=cuda fp16 ==='
++ PAGEDSERVE_TEST_DEVICE=cuda
++ PAGEDSERVE_TEST_DTYPE=float16
++ pytest tests/test_attention_cuda.py tests/test_cuda_graph.py tests/test_extension.py -q -rs
++ tail -40
++ echo '=== C: golden suite device=cuda fp16 (verbose, shows backend params + skips) ==='
++ PAGEDSERVE_TEST_DEVICE=cuda
++ PAGEDSERVE_TEST_DTYPE=float16
++ pytest tests/test_golden.py -v -rs
++ tail -90
++ echo '=== D: whole suite device=cuda fp16 ==='
++ PAGEDSERVE_TEST_DEVICE=cuda
++ PAGEDSERVE_TEST_DTYPE=float16
++ pytest -q -rs --ignore=tests/test_golden.py
++ tail -40
++ echo '=== DONE ==='
+/usr/local/lib/python3.13/dist-packages/mistune.py:435: SyntaxWarning: invalid escape sequence '\|'
+  cells[i][c] = re.sub('\\\\\|', '|', cell)
+/usr/local/lib/python3.13/dist-packages/nbconvert/filters/filter_links.py:36: SyntaxWarning: invalid escape sequence '\_'
+  text = re.sub(r'_', '\_', text) # Escape underscores in display text
+[NbConvertApp] Converting notebook __notebook__.ipynb to notebook
+[NbConvertApp] Writing 20315 bytes to __notebook__.ipynb
+[NbConvertApp] Converting notebook __notebook__.ipynb to html
+[NbConvertApp] Writing 292703 bytes to __results__.html
