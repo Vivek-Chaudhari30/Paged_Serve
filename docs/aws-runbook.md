@@ -230,3 +230,13 @@ and `--teardown-only` paths have been walked end to end on a laptop.
 **The live path has never been executed.** No AWS account has run it, because the GPU quota
 has not been granted yet. Read the `--dry-run` output before the first real launch, and
 watch the first run rather than leaving it unattended.
+
+---
+
+## 10. Free plan accounts cannot launch GPU instances
+
+Verified 2026-10-14: on the AWS **Free plan**, `RunInstances` for `g5.xlarge` fails with
+`InvalidParameterCombination: ... not eligible for Free Tier`, even after a GPU vCPU quota
+increase is approved. Only CPU types (t3/t4g/c7i-flex/m7i-flex/t8i) are eligible. Running
+this script requires upgrading to the Paid plan (credits still apply). Without that, use
+Explorer or Kaggle (`scripts/kaggle_bootstrap.sh`); see `results/verification/`.
