@@ -103,78 +103,81 @@ evaluate the cost.
 
 ## 3. Repository layout
 
+This describes the tree as it exists. If you add or remove a file, update it.
+
 ```
-pagedserve/
+.
 ├── AGENTS.md               # this file
 ├── CLAUDE.md               # pointer to this file
 ├── README.md               # public-facing; results go here (measured only)
-├── pyproject.toml
-├── setup.py                # builds the CUDA extension
-├── .gitignore
+├── LICENSE
+├── pyproject.toml          # package metadata, extras, ruff and pytest config
+├── setup.py                # builds the CUDA extension (explicitly, never via pip)
+├── .github/workflows/ci.yml  # ruff + `pytest -m "not gpu"` on every push / PR
 │
-├── _private/               # GITIGNORED — design docs, not public
+├── _private/               # GITIGNORED — design docs and plans, not public
 │   ├── DESIGN.md
 │   ├── ROADMAP.md
-│   └── AGENT-PROMPTS.md
+│   ├── AGENT-PROMPTS.md
+│   └── FINAL-COMPLETION.md # the completion plan (moved out of the public tree)
 │
 ├── pagedserve/
-│   ├── __init__.py
-│   ├── config.py           # EngineConfig, CacheConfig, SchedulerConfig, ModelConfig
-│   ├── engine.py           # LLMEngine: owns step(), the top-level loop
+│   ├── config.py           # EngineConfig, CacheConfig, SchedulerConfig, ModelConfig; device/dtype
+│   ├── engine.py           # LLMEngine: step(), batch assembly, slot_mapping (no model_runner.py)
 │   ├── sequence.py         # Sequence, SequenceGroup, SequenceStatus
-│   │
+│   ├── extension.py        # optional loader for pagedserve._C (imports torch first)
 │   ├── memory/
-│   │   ├── block_manager.py    # free list, block tables, refcounts, alloc/free/fork
 │   │   ├── block.py            # PhysicalBlock, BlockTable
-│   │   └── prefix_cache.py     # hash chain, LRU evictor  (Phase 5)
-│   │
+│   │   ├── block_manager.py    # free list, block tables, refcounts, alloc/free/fork, CoW
+│   │   └── prefix_cache.py     # hash chain, LRU evictor
 │   ├── core/
-│   │   ├── scheduler.py        # waiting/running/swapped queues, admission, preemption
+│   │   ├── scheduler.py        # waiting/running/swapped queues, admission, preemption, chunking
 │   │   └── policy.py           # preemption policy: RECOMPUTE | SWAP
-│   │
 │   ├── model/
 │   │   ├── loader.py           # safetensors -> state dict
 │   │   ├── llama.py            # manual forward pass
 │   │   ├── layers.py           # RMSNorm, RoPE, GQA attention, SwiGLU
-│   │   └── sampler.py          # greedy, temperature, top-p, top-k
-│   │
+│   │   └── sampler.py          # greedy, temperature, top-p, top-k, repetition penalty
 │   ├── attention/
 │   │   ├── backend.py          # AttentionBackend ABC — REQUIRED indirection layer
 │   │   ├── contiguous.py       # Phase 1: SDPA over a contiguous cache
-│   │   ├── gather.py           # Phase 2: index_select blocks -> scratch -> SDPA
-│   │   └── cuda_paged.py       # Phase 4: wraps the compiled extension
-│   │
+│   │   ├── gather.py           # Phase 2: index_select blocks -> scratch -> SDPA (the oracle)
+│   │   ├── cuda_paged.py       # Phase 4: wraps the compiled extension, falls back to gather
+│   │   └── paged_reference.py  # pure-PyTorch twins of the CUDA ops, same signatures
 │   ├── worker/
-│   │   ├── model_runner.py     # batch assembly, slot_mapping, forward, sample
-│   │   └── cache_engine.py     # KV cache allocation, swap in/out, profiling
-│   │
+│   │   ├── cache_engine.py     # KV cache allocation, swap in/out, capacity profiling
+│   │   └── cuda_graph.py       # Phase 7: bucketed decode CUDA graphs
 │   └── server/
-│       ├── api.py              # FastAPI app, OpenAI-compatible routes
-│       └── protocol.py         # pydantic request/response schemas
+│       ├── api.py              # FastAPI app, EngineRunner, OpenAI-compatible routes
+│       ├── protocol.py         # pydantic request/response schemas
+│       └── __main__.py         # `python -m pagedserve.server` CLI and ablation flags
 │
-├── csrc/                   # C++/CUDA  (Phase 4)
+├── csrc/
 │   ├── bindings.cpp        # pybind11 module definition
 │   ├── paged_attention.cu  # decode kernel
-│   └── cache_kernels.cu    # KV scatter/copy/swap kernels
+│   ├── cache_kernels.cu    # reshape_and_cache, copy_blocks, swap_blocks
+│   └── trivial.cu          # build canary
 │
 ├── bench/
 │   ├── loadgen.py          # Poisson + closed-loop load generator
 │   ├── baseline_hf.py      # HuggingFace generate() baselines
+│   ├── pagedserve_backend.py  # PagedServe driver for loadgen
 │   ├── metrics.py          # TTFT / ITL / E2E percentiles, throughput, goodput
-│   ├── sweep.py            # concurrency and ablation sweeps
+│   ├── sweep.py            # ablation sweeps: arms, block-size, preemption, prefix
 │   └── plot.py             # regenerates every README chart from results/
 │
-├── tests/
-│   ├── test_golden.py      # token-for-token vs HuggingFace — the gate
-│   ├── test_block_manager.py
-│   ├── test_scheduler.py
-│   ├── test_prefix_cache.py
-│   └── test_attention_parity.py   # cuda backend vs gather backend
-│
-├── results/                # committed raw benchmark JSON — the evidence
+├── tests/                  # one file per module; test_golden.py is the gate,
+│                           # test_attention_cuda.py diffs the kernels against the reference
+├── docs/                   # design.md, how-it-works.md, vllm-gap.md, design-qa.md, aws-runbook.md
+├── results/                # committed raw benchmark JSON — the evidence (does not exist yet)
 └── scripts/
+    ├── aws_bench.sh        # EC2 launch -> sweep -> teardown
+    ├── explorer_job.sbatch # SLURM job template (A100)
     ├── kaggle_bootstrap.sh # clone + install + run, for notebook environments
-    └── explorer_job.sbatch # SLURM job template
+    ├── make_charts.sh      # results/ -> docs/charts/
+    ├── fetch_dataset.sh    # ShareGPT download
+    ├── conductor_setup.sh  # links _private/ into a fresh worktree
+    └── gpu_smoke.py, gpu_diagnose_*.py  # GPU smoke test and diagnostics
 ```
 
 **Create files as phases need them, not up front.** Do not scaffold empty modules for future
@@ -289,209 +292,80 @@ the commit gate never ran. Use the command above.
 
 ## 7. Current status
 
-**Current phase: 2 (Wave 2) — the first GPU benchmark sweep.**
+**Current phase: the first GPU benchmark sweep.** All nine phases have code. What is left is
+GPU work: verify the CUDA kernel and CUDA graphs, then run the sweep and commit `results/`.
 
-Phases 0, 1, 2, 3, 5 and 6 are functionally complete and CPU-verified, with
-correctness additionally verified on a Tesla T4. Phase 4 is build scaffolding
-only — the decode kernel is not written. Phases 7, 8 and 9 have no code.
+| Phase | State |
+|---|---|
+| 0 Benchmark harness | complete; CPU-verified |
+| 1 Naive engine, contiguous KV | complete; golden-verified on CPU and T4 |
+| 2 Paged KV, gather backend | complete; golden-verified on CPU and T4 |
+| 3 Continuous batching | complete; golden-verified on CPU and T4, both preemption policies |
+| 4 CUDA paged attention | **code complete, never compiled.** CPU-tested through `paged_reference.py` only |
+| 5 Prefix caching | complete; golden-verified on CPU and T4, cache on and off |
+| 6 OpenAI-compatible server | complete; CPU-verified |
+| 7 Chunked prefill, CUDA graphs, async detok | code complete; chunked prefill golden-verified on CPU; CUDA graphs never run |
+| 8 Ablations | tooling complete (`bench/sweep.py`, CLI flags, `scripts/make_charts.sh`); no sweep run |
+| 9 Writeup | `docs/design.md`, `docs/vllm-gap.md`, `docs/design-qa.md` written; results await a sweep |
 
-`results/` does not exist. Five phases (0, 2, 3, 5, 6) each hang on exactly one
-unchecked box and it is the same box in every case: run the sweep on a GPU. One
-successful GPU session closes all five, and that is the next work. The plan for
-it is in `FINAL-COMPLETION.md`.
+`results/` does not exist. Phases 0, 2, 3, 5 and 6 each hang on exactly one unchecked box, and
+it is the same box: run the sweep on a GPU. One successful GPU session closes all five.
 
-**Previous phase: 6 — FastAPI server.**
+### Next GPU session, in order
 
-Phase 6 deliverables:
-- [x] OpenAI-compatible `/v1/completions` and `/v1/chat/completions`
-- [x] SSE streaming, per-request `asyncio.Queue` fed by a background engine loop
-- [x] Full sampling: temperature, top-p, top-k, repetition penalty, stop strings
-- [x] `n>1` via block-table forking
-- [x] Client disconnect frees blocks immediately, verified by the free-block count
-- [ ] Full sweep through the HTTP path — **needs a GPU.**
+1. `python setup.py build_ext --inplace`, then `pytest -m gpu tests/test_attention_cuda.py`
+   (compiled kernels diffed against the reference ops).
+2. The golden gate on the `cuda` backend:
+   `PAGEDSERVE_TEST_DEVICE=cuda PAGEDSERVE_TEST_DTYPE=float16 pytest`.
+3. Only then, `python -m bench.sweep ...` and commit the raw JSON under `results/`.
 
-```bash
-python -m pagedserve.server --model Qwen/Qwen2.5-0.5B-Instruct --num-blocks 512
-```
+### Verified on a Tesla T4 (sm_75, torch 2.10+cu128, float16 and float32)
 
-**Greedy is unchanged.** An all-greedy batch short-circuits to `argmax` and
-never touches softmax or multinomial — five phases of golden tests depend on it
-being bit-for-bit stable. Golden still passes 44/44.
+Correctness only. A Kaggle T4 is shared and unpinnable, so its timings are not evidence (§4).
 
-**Stop strings live in the server, not the engine.** Detecting them needs a
-detokenizer and AGENTS.md §2.5 keeps the tokenizer out of the hot loop. The
-engine handles stop *tokens*, which need no decoding.
-
-**Previous phase: 5 — block-aligned prefix caching.**
-
-Phase 5 deliverables:
-- [x] `memory/prefix_cache.py` — chained hashing, hash-to-block index, LRU pool
-- [x] Reuse on admission: walk blocks in order, bump refcounts, stop at the
-      first miss, and skip prefill for the cached span
-- [x] Copy-on-write when a sequence writes into a shared block — implemented
-      and tested, but **not reachable from prefix caching alone**: only full
-      blocks are cached and a full block is never written to again. It is for
-      `fork()` in Phase 6.
-- [x] LRU eviction: refcount-zero blocks stay cached until the allocator needs them
-- [x] Metrics: hit rate, tokens saved, evictions — in the result JSON
-- [ ] TTFT with and without — **needs a GPU.**
-
-Golden test passes with caching on and off, producing identical tokens.
-Measured on a shared system prompt with staggered arrivals: 78.9% block hit
-rate, 240 tokens of prefill skipped (CPU, correctness run — not a benchmark).
-
-**Reuse requires staggered arrivals.** Requests admitted in the same step
-cannot share: nothing has been through a forward pass, so there is no KV to
-reuse. A batch fired all at once shows a 0% hit rate and that is correct.
-
-**Phase 4 is partially done** — step 1 (build scaffolding) is verified on a T4;
-the decode kernel itself is not started.
-
-**Previous phase: 3 — continuous batching scheduler.**
-
-### Phase 4 step 1 — CUDA extension scaffolding: VERIFIED on a T4
-
-- [x] `nvcc` compiles `csrc/trivial.cu`; links `pagedserve._C` against libtorch
-- [x] Architecture inferred as `sm_75` from the visible GPU — `setup.py`
-      deliberately passes no `-arch`, since a hardcoded one yields a binary that
-      will not load on any other card
-- [x] Build canary passes: round-trip, non-contiguous input, empty tensor,
-      1M elements, CPU rejection, dtype rejection, no input mutation
-- [x] `importable: True` from a fresh process with torch not previously imported
-
-Build it explicitly, never via `pip install` — pip builds in an isolated
-environment with no torch, so the extension silently would not build:
-
-```bash
-python setup.py build_ext --inplace
-```
-
-**`extension.py` must import torch before `pagedserve._C`.** The extension links
-against libc10/libtorch, which live in torch's package directory rather than on
-the loader's search path. pytest imports torch first, so a test suite cannot
-catch this — a fresh-subprocess regression test does.
-
-### GPU verification status (Tesla T4, sm_75, torch 2.10+cu128, float16)
-
-Correctness is verified on real CUDA hardware. Nothing below is a benchmark —
-a Kaggle T4 is shared and unpinnable, so its timings are not evidence (§4).
-
-- [x] Golden gate: **44/44 pass on GPU**, both backends, float16 and float32,
-      **prefix caching on and off** — a cache hit shortens the prefill and so
-      changes the SDPA shape, kernel, and reduction order, and the output is
-      still identical
-- [x] CUDA extension: 13/13, including the fresh-subprocess loader test
-- [x] `profile_num_blocks` measurement branch (see the known gap below)
-- [x] `SwapSpace` round-trip through genuinely pinned host memory
-- [x] Paged and contiguous produce **bit-identical logits** (max diff 0.000000)
+- [x] Golden gate 44/44, `contiguous` and `gather`, both dtypes, prefix caching on and off
+- [x] Paged and contiguous produce bit-identical logits
 - [x] Forced preemption invisible in the output, both policies
 - [x] Every configuration deterministic across repeated runs
+- [x] CUDA extension build canary 13/13, including the fresh-subprocess loader test
+- [x] `SwapSpace` round-trip through genuinely pinned host memory
 
-**Do not run on emulated bfloat16.** Turing has no native bf16, and
-`torch.cuda.is_bf16_supported()` returns True there anyway because it counts
-emulation. `resolve_dtype` picks by compute capability instead; anything that
-selects a dtype must ask it rather than reimplement the check.
+### Known gaps
 
-**Known gap:** `profile_num_blocks` runs no profiling forward pass, so
-activation memory counts as zero and the block count is optimistic — it handed
-13.1 GB of a 14.6 GiB card to KV. Pass `--num-blocks` explicitly for any run
-that must not OOM. A two-pass profile is the real fix.
+- **Capacity profiling is optimistic unless a forward pass is injected.** Without
+  `run_max_shape_forward`, `profile_num_blocks` counts activation memory as zero — it handed
+  13.1 GB of a 14.6 GiB T4 to KV. Pass `--num-blocks` explicitly for any run that must not OOM.
+- **The client-disconnect test failed on a T4** while passing on CPU.
+  `scripts/gpu_diagnose_disconnect.py` is the committed diagnostic; Phase 7 reworked abort
+  handling (deferred aborts, prompt block release), and the test must be re-run on a GPU.
+- **Copy-on-write is not reachable from prefix caching alone** — only full blocks are cached
+  and a full block is never written again. It exists for `fork()` (`n > 1`).
+- **Prefix reuse needs staggered arrivals.** Requests admitted in the same step cannot share:
+  nothing has been through a forward pass yet. A 0% hit rate on a simultaneous burst is correct.
 
-Phase 3 deliverables:
-- [x] `core/scheduler.py` — waiting/running/swapped queues, `schedule()` every
-      iteration, admission budgeted on BOTH `max_num_batched_tokens` and
-      `max_num_seqs`
-- [x] Retire on EOS / max_tokens, freeing blocks in the same step
-- [x] `core/policy.py` — RECOMPUTE and SWAP, selectable by config, tail
-      victim selection with the fairness tradeoff documented
-- [x] Ragged batch assembly — one step mixes prefills of different lengths with
-      single-token decodes, flattened with cumulative sequence lengths, no padding
-- [x] Forced-preemption tests for BOTH policies: resumed sequences produce
-      output identical to an unpreempted run
-- [ ] Full concurrency sweep committed to `results/` — **needs a GPU.**
+### Things that have bitten this project — do not relearn them
 
-The engine is now benchmarkable through the Phase 0 harness. Three ablation
-arms, one command each — the moment a GPU is available these produce committable
-result JSON:
+- **Never trust `torch.cuda.is_bf16_supported()` on Turing.** It returns True because it
+  counts emulation. `resolve_dtype` picks by compute capability; ask it, do not reimplement it.
+- **Build the extension explicitly, never via `pip install`.** pip builds in an isolated
+  environment with no torch, and the build silently does not happen.
+- **`extension.py` must import torch before `pagedserve._C`.** libc10/libtorch live in torch's
+  package directory, not on the loader path. pytest imports torch first, so only a
+  fresh-subprocess test catches a regression.
+- **`setup.py` passes no `-arch`.** A hardcoded architecture produces a binary that will not
+  load on any other card.
+- **Greedy must stay bit-for-bit stable.** An all-greedy batch short-circuits to `argmax` and
+  never touches softmax or multinomial; every golden test depends on it.
+- **Stop strings live in the server, not the engine.** They need a detokenizer, and §2.5 keeps
+  the tokenizer out of the hot loop. The engine handles stop *tokens* only.
+- **`apply_chat_template(tokenize=True)` returns a `BatchEncoding` on transformers v5** and a
+  list of ints on v4. `list()` on a `BatchEncoding` iterates its keys.
+- **Bookkeeping ratios are not benchmarks.** The KV utilization figures in the README are
+  allocated-versus-live accounting from CPU correctness runs. Quote `max_seq_len` and the
+  workload with them, or they mean nothing.
 
-| Arm | Flag | Isolates |
-|---|---|---|
-| contiguous + static | `--no-paging` | the naive floor |
-| paged + static | `--static-batching` | paging alone |
-| paged + continuous | (default) | iteration-level scheduling |
-
-```bash
-python bench/loadgen.py --backend pagedserve --model Qwen/Qwen2.5-0.5B-Instruct \
-    --mode closed --concurrency 32 --num-requests 256 --max-tokens 128 \
-    --output results/<run>.json
-```
-
-Continuous batching output is token-identical to static batching, and stays
-identical under forced preemption with either policy.
-
-**Previous phase: 2 — paged KV cache (Python gather path).**
-
-Phase 2 deliverables:
-- [x] `memory/block.py`, `memory/block_manager.py` — free list, block tables,
-      refcounts, `can_allocate`/`allocate`/`append_slot`/`free`/`fork`
-- [x] `worker/cache_engine.py` — capacity profiling, one preallocation
-- [x] Write path: flat `slot_mapping`, one fused `index_copy_`, no per-sequence loop
-- [x] `attention/gather.py` — the correctness oracle, kept forever
-- [x] Paging off via `attn_backend="contiguous"` (the `--no-paging` path).
-      **Not yet a CLI flag** — there is no engine CLI until Phase 6; Phase 8
-      makes it first-class.
-- [x] `tests/test_block_manager.py` with the §5 invariants
-- [ ] Throughput comparison vs Phase 1 — needs a GPU; a CPU timing is not evidence.
-
-Measured KV utilization, 4 prompts, `block_size=16` (CPU/fp32, so pure
-allocated-versus-live bookkeeping — device-independent):
-
-| generated tokens | contiguous | paged |
-|---|---|---|
-| 16 | 2.1% | 68.0% |
-| 48 | 5.1% | 80.9% |
-| 96 | 8.6% | 87.8% |
-| 256 | — | 94.4% |
-
-Paged utilization rises with length because waste is bounded by
-`block_size - 1` in the last block only, instead of by `max_seq_len`. Output is
-bit-identical between the two backends.
-
-**Previous phase: 1 — naive engine with a contiguous KV cache.**
-
-Phase 1 deliverables:
-- [x] `model/loader.py` — safetensors into a state dict
-- [x] `model/layers.py` — RMSNorm, RoPE, GQA attention, SwiGLU
-- [x] `model/llama.py` — manual forward pass with KV cache write hooks
-- [x] `attention/backend.py` ABC + `attention/contiguous.py`
-- [x] Static batching loop, left padding, greedy decode
-- [x] Memory instrumentation: allocated vs live KV bytes
-- [x] `tests/test_golden.py` — token-for-token vs HuggingFace. **This is now
-      the commit gate.**
-
-Target model: `Qwen/Qwen2.5-0.5B-Instruct` (ungated, so no HF token is needed
-in any of the three environments). It is Llama-style but biases Q/K/V and ties
-its embeddings; both are read from the checkpoint, not branched on by name.
-
-Measured utilization: **2.1%** on an 8-prompt heavy-tailed batch with
-`max_seq_len=2048`, 32 new tokens each (CPU/fp32). The ratio is pure
-allocated-versus-live bookkeeping and so is device-independent, but it depends
-entirely on `max_seq_len` and the workload — quote both or the number means
-nothing.
-
-**Previous phase: 0 — environment, baseline, and the measurement harness.**
-
-Phase 0 deliverables:
-- [x] `pyproject.toml`, package skeleton, ruff config
-- [x] `bench/metrics.py` — percentile computation from raw per-request timings
-- [x] `bench/loadgen.py` — Poisson and closed-loop modes, pluggable backend
-- [x] `bench/baseline_hf.py` — HuggingFace sequential and static-batched baselines
-- [x] `scripts/kaggle_bootstrap.sh` and `scripts/explorer_job.sbatch`
-- [ ] First baseline sweep committed to `results/` — **needs a GPU; cannot be
-      closed on macOS.** Everything above is verified on CPU against a tiny
-      random-init Llama, which exercises the logic but measures nothing.
-
-Do not begin Phase 1 until every box is checked and the user confirms.
+Target model: `Qwen/Qwen2.5-0.5B-Instruct` (ungated). Llama-style, but with Q/K/V biases and
+tied embeddings; both are read from the checkpoint, never branched on by name.
 
 Update this section when a phase completes.
 

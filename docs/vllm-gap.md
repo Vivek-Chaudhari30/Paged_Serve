@@ -1,7 +1,7 @@
 # Gap analysis: PagedServe vs vLLM
 
-FINAL-COMPLETION.md W4. This is a qualitative, code-level comparison. **It contains no
-measured ratios**: no vLLM comparison run (B5) has been committed under `results/`. When one
+This is a qualitative, code-level comparison. **It contains no
+measured ratios**: no vLLM comparison run has been committed under `results/`. When one
 is, its numbers belong in the README with a link to the raw files, not here.
 
 | Area | PagedServe | vLLM | Expected impact |

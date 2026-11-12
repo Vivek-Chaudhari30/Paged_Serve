@@ -5,11 +5,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pagedserve"
 version = "0.0.0"
-description = "A from-scratch high-throughput LLM inference server: paged KV cache, continuous batching, custom CUDA paged attention."
+description = "A from-scratch LLM inference server: paged KV cache, continuous batching, prefix caching, custom CUDA paged attention, OpenAI-compatible API."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-authors = [{ name = "Vivek" }]
+authors = [{ name = "Vivek Chaudhari" }]
+keywords = ["llm", "inference", "serving", "paged-attention", "kv-cache", "continuous-batching", "cuda"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 # Base install is deliberately light: the benchmark harness (bench/metrics.py,
 # bench/loadgen.py) must import and run on a laptop with no torch and no GPU.
@@ -24,8 +32,13 @@ server = ["fastapi>=0.110", "uvicorn>=0.29", "pydantic>=2.6"]
 # HuggingFace reference baseline and the golden test's oracle. Never a runtime
 # component of the engine itself.
 baseline = ["transformers>=4.40"]
-dev = ["pytest>=8.0", "ruff>=0.4", "matplotlib>=3.8"]
+# httpx backs fastapi.testclient in tests/test_server.py.
+dev = ["pytest>=8.0", "ruff>=0.4", "matplotlib>=3.8", "httpx>=0.27"]
 all = ["pagedserve[engine,server,baseline,dev]"]
+
+[project.urls]
+Repository = "https://github.com/Vivek-Chaudhari30/Paged_Serve"
+Documentation = "https://github.com/Vivek-Chaudhari30/Paged_Serve/tree/main/docs"
 
 [tool.setuptools.packages.find]
 # bench is installed too, so `python bench/loadgen.py` and `from bench.metrics

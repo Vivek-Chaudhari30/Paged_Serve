@@ -1,6 +1,6 @@
 # Design questions and answers
 
-FINAL-COMPLETION.md W6. Answers are about mechanisms in this codebase. Any performance
+Answers are about mechanisms in this codebase. Any performance
 figure must come from `results/`; there are none committed yet, so none appear here.
 
 **Why paging?** A contiguous cache reserves `max_seq_len` slots per sequence up front.

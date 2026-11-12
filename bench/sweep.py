@@ -5,12 +5,12 @@ that directory into charts. This script produces no numbers itself, and it
 never fabricates a result for a run that failed — a failed run is logged and
 leaves no file behind.
 
-Sweeps (FINAL-COMPLETION.md §3.6):
+Sweeps:
 
 - ``arms``       — contiguous / paged-static / paged-continuous across concurrency
-- ``block-size`` — block sizes 1..128 on the continuous arm (B2)
-- ``preemption`` — recompute vs swap under a starved cache (B3)
-- ``prefix``     — shared-prefix fraction 0..0.9, cache off vs on (B4)
+- ``block-size`` — block sizes 1..128 on the continuous arm
+- ``preemption`` — recompute vs swap under a starved cache
+- ``prefix``     — shared-prefix fraction 0..0.9, cache off vs on
 
 Usage::
 

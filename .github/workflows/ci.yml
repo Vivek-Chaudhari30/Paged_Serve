@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned so a ruff release cannot reformat the tree out from under a PR.
+      - run: pip install "ruff==0.16.4"
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    # CPU only: GitHub-hosted runners have no GPU. Tests marked `gpu` are
+    # deselected; the golden gate runs on CPU against the real reference model.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # CPU wheels first, so the CUDA build and its multi-GB dependencies are
+      # never pulled onto a runner that cannot use them.
+      - name: Install torch (CPU)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install PagedServe
+        run: pip install -e ".[all]"
+      - name: Cache the golden reference model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-Qwen2.5-0.5B-Instruct-v1
+      # Without the model the golden gate and server tests SKIP rather than
+      # pass, so fetch it explicitly instead of letting CI go green on a skip.
+      - name: Fetch the golden reference model
+        run: hf download Qwen/Qwen2.5-0.5B-Instruct
+      - name: Test
+        run: pytest -m "not gpu" -ra

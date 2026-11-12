@@ -3,7 +3,7 @@
 This document explains what this project does and why, assuming no background in GPUs,
 CUDA kernels, or model serving. Every technical term is defined the first time it appears.
 
-It is a companion to `AGENTS.md` (the rules) and the private design docs (the rationale).
+It is a companion to `AGENTS.md` (the rules) and `docs/design.md` (the engineering detail).
 Those are written for someone building the system. This one is written for someone trying
 to understand it, or to explain it out loud.
 
@@ -357,7 +357,7 @@ Nine planned phases. All have code; the GPU-only parts await a GPU run.
 and it passes 44 of 44 cases on a real GPU (Tesla T4, float16), with paging on and off, and
 with prefix caching on and off. The paged and contiguous paths produce bit-identical
 intermediate values. Forced eviction is invisible in the output under both policies. There
-are 423 test functions in total.
+are more than 500 tests in total, and CI runs every one that does not need a GPU on each push.
 
 **Performance is entirely unmeasured.** There is no `results/` directory. Every phase
 carries an unchecked box reading "needs a GPU". Two known open items are recorded honestly
@@ -497,7 +497,12 @@ is the remaining work.**
 | HTTP server, streaming, disconnect handling | `pagedserve/server/api.py` |
 | Load generator, latency percentiles | `bench/loadgen.py`, `bench/metrics.py` |
 | The correctness gate | `tests/test_golden.py` |
-| CUDA build canary | `csrc/trivial.cu` |
+| The CUDA paged-attention decode kernel | `csrc/paged_attention.cu` |
+| KV scatter, block copy and swap kernels | `csrc/cache_kernels.cu` |
+| The kernels' pure-PyTorch twins (CPU tests) | `pagedserve/attention/paged_reference.py` |
+| The `cuda` backend and its fallback | `pagedserve/attention/cuda_paged.py` |
+| Decode CUDA graphs | `pagedserve/worker/cuda_graph.py` |
+| Ablation sweep driver, chart generation | `bench/sweep.py`, `bench/plot.py` |
 
 The module docstrings are unusually detailed on purpose — most of them explain *why* the
 design is what it is, not just what the code does. `pagedserve/memory/prefix_cache.py` and

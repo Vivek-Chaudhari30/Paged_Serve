@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate every chart from committed raw results (FINAL-COMPLETION.md W3).
+# Regenerate every chart from committed raw results.
 # Charts with missing inputs are skipped with a message, never faked.
 set -euo pipefail
 cd "$(dirname "$0")/.."

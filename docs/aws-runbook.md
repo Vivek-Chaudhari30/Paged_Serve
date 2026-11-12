@@ -24,8 +24,8 @@ console.
 
 A brand-new AWS account is allowed **zero** vCPUs of GPU instance. You cannot launch a
 `g5.xlarge` until you ask permission, and approval takes **1–3 days**. Start it before you
-do anything else in this document; everything in Wave 1 of `FINAL-COMPLETION.md` can be
-done on your laptop while you wait.
+do anything else in this document; all the CPU-side work (tests, a `--dry-run` rehearsal)
+can be done on your laptop while you wait.
 
 1. Create an account at `aws.amazon.com`. Stay on the **Free plan**; do not upgrade.
 2. **Turn on MFA for the root account.** Console → your name (top right) → Security
@@ -198,8 +198,8 @@ Check two other places once a month:
 
 ## 7. Budget
 
-The plan in `FINAL-COMPLETION.md` fits the remaining project inside roughly $83 of $100
-credits. The first sweep is about $18 of that.
+A `g5.xlarge` bills by the second while it exists. Set a billing alarm (§1) before the first
+launch, and size each sweep against it rather than leaving a box running between runs.
 
 **Spot instances** cost roughly a third of on-demand and AWS can reclaim them with two
 minutes' notice. That trade is good for kernel development, where losing the box costs you a

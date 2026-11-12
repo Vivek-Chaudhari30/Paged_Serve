@@ -1,6 +1,6 @@
 # PagedServe design
 
-A public, trimmed design document (FINAL-COMPLETION.md W2). It describes what the code does
+A public design document. It describes what the code does
 and why. It contains no performance numbers: per `AGENTS.md` §2.1, every figure must trace
 to a committed raw result under `results/`, and no GPU sweep has been committed yet.
 
@@ -94,8 +94,7 @@ slots skipped), `copy_blocks` (copy-on-write style block copies across layers) a
 the same signatures and the same online-softmax structure. CPU tests run the cuda backend
 with these reference ops; GPU tests (`-m gpu`) diff the compiled ops against them.
 
-**Status:** the CUDA sources have not been compiled or run in this repository's CI
-environment (no CUDA toolkit or GPU). They must pass `pytest -m gpu tests/test_attention_cuda.py`
+**Status:** the CUDA sources have not yet been compiled or run on a GPU (CI is CPU-only). They must pass `pytest -m gpu tests/test_attention_cuda.py`
 and the golden gate on the `cuda` backend before any claim is made about them.
 
 ## 5. CUDA graphs (`pagedserve/worker/cuda_graph.py`)
