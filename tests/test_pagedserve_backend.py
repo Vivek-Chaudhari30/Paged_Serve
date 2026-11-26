@@ -157,6 +157,16 @@ class TestPagedServeBackend:
         assert backend.steps > 0
         assert backend.batch_sizes
 
+    def test_reports_kv_utilization_from_the_block_manager(self, tiny_model):
+        """The KV-utilization chart needs a measured ratio in every result file."""
+        backend = PagedServeBackend(build_engine(tiny_model))
+        asyncio.run(run_closed_loop(backend, prompts(4), concurrency=4))
+        asyncio.run(backend.aclose())
+        stats = backend.kv_stats()
+        assert stats is not None
+        assert stats["samples"] > 0
+        assert 0.0 < stats["mean_utilization"] <= stats["peak_utilization"] <= 1.0
+
 
 class TestStaticEngineBackend:
     def test_batches_and_completes(self, tiny_model):
@@ -180,6 +190,15 @@ class TestStaticEngineBackend:
         records = asyncio.run(run_closed_loop(backend, prompts(4), concurrency=4))
         asyncio.run(backend.aclose())
         assert all(r.succeeded for r in records)
+
+    @pytest.mark.parametrize("attn", ["gather", "contiguous"])
+    def test_reports_kv_utilization(self, tiny_model, attn):
+        backend = StaticEngineBackend(build_engine(tiny_model, backend=attn), max_batch_size=4)
+        asyncio.run(run_closed_loop(backend, prompts(4), concurrency=4))
+        asyncio.run(backend.aclose())
+        stats = backend.kv_stats()
+        assert stats is not None
+        assert 0.0 < stats["mean_utilization"] <= 1.0
 
     def test_streams_per_step(self, tiny_model):
         backend = StaticEngineBackend(build_engine(tiny_model), max_batch_size=2)

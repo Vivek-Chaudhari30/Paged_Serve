@@ -52,6 +52,7 @@ __all__ = [
     "BackendFn",
     "MockBackend",
     "PromptRequest",
+    "apply_long_prompts",
     "build_result",
     "collect_environment",
     "poisson_offsets",
@@ -427,6 +428,41 @@ def synthetic_prompts(
     ]
 
 
+def apply_long_prompts(
+    prompts: list[PromptRequest],
+    *,
+    words: int,
+    fraction: float,
+    rng: random.Random,
+) -> tuple[list[PromptRequest], int]:
+    """Replace ``fraction`` of the prompts with long ones, ``words`` words each.
+
+    Chunked prefill exists for one situation: a long prompt arriving while other
+    requests are decoding, whose prefill would otherwise monopolise a step and
+    stall every stream in the batch. ShareGPT's first turns are mostly short, so
+    that situation has to be put into the workload deliberately, at a known rate,
+    for the ITL tail with and without chunking to be comparable.
+
+    Each long prompt opens with its own index, so no two share a first block and
+    a run with prefix caching on cannot turn the experiment into a cache test.
+    Returns the prompts and how many were replaced, for the result file.
+    """
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError(f"long-prompt fraction must be in [0, 1], got {fraction}")
+    if words <= 0 or fraction == 0:
+        return prompts, 0
+    count = round(len(prompts) * fraction)
+    # Chosen by index for the same reason as apply_shared_prefix: arrival order
+    # is part of the workload and must be identical across the arms compared.
+    chosen = set(rng.sample(range(len(prompts)), count)) if count else set()
+    filler = " ".join(["token"] * max(0, words - 2))
+    out = [
+        replace(p, prompt=f"request {i} {filler}") if i in chosen else p
+        for i, p in enumerate(prompts)
+    ]
+    return out, len(chosen)
+
+
 SHARED_PREFIX_SENTENCE = (
     "You are a helpful assistant. Answer accurately, cite your sources, and say "
     "so plainly when you do not know. Keep responses concise unless asked to "
@@ -528,9 +564,9 @@ def load_sharegpt(
 def _build_backend(name: str, args: argparse.Namespace) -> BackendFn:
     """Resolve a backend by name.
 
-    Only the mock exists in Phase 0. The HuggingFace baseline registers here
-    next, and the engine and HTTP backends after that; the generator itself
-    does not change when they do.
+    Every backend is the same async callable, so adding one never changes the
+    generator, the timestamps, or the result format -- which is what lets an
+    in-process engine, an HTTP server and vLLM be compared at all.
     """
     if name == "mock":
         return MockBackend(ttft=args.mock_ttft, itl=args.mock_itl)
@@ -611,7 +647,35 @@ def _build_backend(name: str, args: argparse.Namespace) -> BackendFn:
 
         backend.tokenizer = AutoTokenizer.from_pretrained(resolve_model_path(args.model))
         return backend
-    raise ValueError(f"unknown backend {name!r} (available: mock, hf, pagedserve)")
+    if name == "openai":
+        from bench.http_backend import HTTPBackendConfig, OpenAIHTTPBackend
+
+        if not args.model:
+            raise ValueError(
+                "--model is required for the openai backend: it is sent as the request's "
+                "model field and names the tokenizer used to count prompt tokens"
+            )
+        backend = OpenAIHTTPBackend(
+            HTTPBackendConfig(
+                base_url=args.base_url,
+                model=args.served_model_name or args.model,
+                endpoint=args.http_endpoint,
+            )
+        )
+        # Optional: only for counting prompt tokens. The request carries text,
+        # so the server tokenizes on its own clock, exactly as a client's
+        # request would be. Without a tokenizer prompt_tokens stays unknown
+        # rather than estimated.
+        try:
+            from transformers import AutoTokenizer
+
+            from pagedserve.model.loader import resolve_model_path
+
+            backend.tokenizer = AutoTokenizer.from_pretrained(resolve_model_path(args.model))
+        except Exception as exc:  # noqa: BLE001 - counting is optional, the run is not
+            logger.warning("no tokenizer for %s (%s); prompt_tokens will be null", args.model, exc)
+        return backend
+    raise ValueError(f"unknown backend {name!r} (available: mock, hf, pagedserve, openai)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -619,7 +683,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="PagedServe load generator: Poisson open-loop and closed-loop modes."
     )
-    parser.add_argument("--backend", default="mock", help="Backend to drive (currently: mock).")
+    parser.add_argument(
+        "--backend",
+        default="mock",
+        choices=("mock", "hf", "pagedserve", "openai"),
+        help="mock | hf (HuggingFace baseline) | pagedserve (in-process engine) | openai "
+        "(any OpenAI-compatible server over HTTP: `python -m pagedserve.server` or "
+        "`vllm serve`).",
+    )
+    parser.add_argument(
+        "--base-url",
+        default="http://127.0.0.1:8000/v1",
+        help="openai backend: the server's API root.",
+    )
+    parser.add_argument(
+        "--http-endpoint",
+        default="completions",
+        choices=("completions", "chat"),
+        help="openai backend: /completions sends the raw prompt; /chat applies the "
+        "server's chat template.",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        default=None,
+        help="openai backend: the model field to send, when the server registered the "
+        "model under a different name than --model.",
+    )
     parser.add_argument(
         "--mode",
         default="poisson",
@@ -690,6 +779,22 @@ def build_parser() -> argparse.ArgumentParser:
         "admitted in the same step have no computed KV to share, so a burst "
         "shows a 0%% hit rate and that is correct.",
     )
+    parser.add_argument(
+        "--prompt-words",
+        type=int,
+        default=0,
+        help="Use fixed-length synthetic prompts of this many words instead of the "
+        "dataset. The preemption sweep needs prompt length as a controlled variable, "
+        "which a heavy-tailed dataset cannot give it.",
+    )
+    parser.add_argument(
+        "--long-prompt-words",
+        type=int,
+        default=0,
+        help="Replace --long-prompt-fraction of the prompts with prompts this many "
+        "words long. 0 disables it. The chunked-prefill workload.",
+    )
+    parser.add_argument("--long-prompt-fraction", type=float, default=0.0)
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=32)
@@ -730,6 +835,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Ablation arm label written to workload.arm (set by bench/sweep.py).",
     )
+    parser.add_argument(
+        "--sweep",
+        default=None,
+        help="Sweep name written to workload.sweep (set by bench/sweep.py).",
+    )
     parser.add_argument("--mock-ttft", type=float, default=0.01)
     parser.add_argument("--mock-itl", type=float, default=0.001)
     return parser
@@ -743,7 +853,14 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
     rng = random.Random(args.seed)
     backend = _build_backend(args.backend, args)
 
-    if args.dataset:
+    if args.prompt_words > 0:
+        if args.dataset:
+            logger.warning("--prompt-words overrides --dataset %s", args.dataset)
+        prompts = synthetic_prompts(
+            args.num_requests, max_tokens=args.max_tokens, words=args.prompt_words
+        )
+        dataset_name = f"synthetic-{args.prompt_words}w"
+    elif args.dataset:
         prompts = load_sharegpt(
             args.dataset, args.num_requests, rng=rng, max_tokens=args.max_tokens
         )
@@ -751,6 +868,10 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
     else:
         prompts = synthetic_prompts(args.num_requests, max_tokens=args.max_tokens)
         dataset_name = "synthetic"
+
+    prompts, num_long = apply_long_prompts(
+        prompts, words=args.long_prompt_words, fraction=args.long_prompt_fraction, rng=rng
+    )
 
     # Applied before tokenization so the shared span is tokenized as part of the
     # prompt, exactly as a real system prompt would be.
@@ -784,6 +905,18 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
         if aclose is not None:
             await aclose()
 
+    server_info: Any = None
+    if args.backend == "openai":
+        # What the run was against, as the server itself describes it. A vLLM
+        # number and a PagedServe number are only comparable if the file says
+        # which was which without relying on the arm label.
+        from bench.http_backend import fetch_json
+
+        try:
+            server_info = await fetch_json(args.base_url, "/models")
+        except Exception as exc:  # noqa: BLE001 - provenance, not the measurement
+            logger.warning("could not read %s/models: %s", args.base_url, exc)
+
     slo = SLO(ttft=args.slo_ttft, tpot=args.slo_tpot, e2e=args.slo_e2e)
     workload: dict[str, Any] = {
         "dataset": dataset_name,
@@ -808,9 +941,31 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
             "realised_fraction": num_prefixed / len(prompts) if prompts else None,
         }
 
+    if args.prompt_words > 0:
+        workload["prompt_words"] = args.prompt_words
+    if args.long_prompt_words > 0:
+        workload["long_prompts"] = {
+            "words": args.long_prompt_words,
+            "requested_fraction": args.long_prompt_fraction,
+            "num_requests_long": num_long,
+            "realised_fraction": num_long / len(prompts) if prompts else None,
+        }
+
     if args.arm:
         # An explicit label beats inference in bench/plot.py.
         workload["arm"] = args.arm
+    if args.sweep:
+        workload["sweep"] = args.sweep
+
+    http_stats = getattr(backend, "stats", None)
+    if callable(http_stats):
+        # How tokens were counted over HTTP: SSE text events, against the
+        # server's own usage count when it reports one.
+        workload["http"] = http_stats()
+
+    kv_stats = getattr(backend, "kv_stats", None)
+    if callable(kv_stats) and (stats := kv_stats()) is not None:
+        workload["kv_stats"] = stats
 
     # Evidence that a batching backend actually batched. Without this, a static
     # batching run that silently degraded to batches of one would be
@@ -849,6 +1004,10 @@ async def _main_async(args: argparse.Namespace) -> dict[str, Any]:
             # The full EngineConfig dump AGENTS.md section 6 asks for. Without
             # it a run is not reproducible, however good its numbers look.
             "engine": (backend.engine.config_dict() if hasattr(backend, "engine") else None),
+            # The model a run measured, at the top level, because an HTTP run
+            # has no engine config to read it from.
+            "model": args.model,
+            "server": server_info,
         },
         workload=workload,
         slo=slo if not slo.is_empty() else None,

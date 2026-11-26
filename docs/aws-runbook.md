@@ -165,6 +165,27 @@ It prints the plan and the hourly cost, then waits for you to type `LAUNCH`. Wha
 8. Terminates the instance and polls until AWS confirms the state. The last line of output
    is that state.
 
+### The second session: kernel, ablations, and vLLM
+
+The default sections (baselines, arms, prefix, poisson) are the headline. The rest roughly
+double the run time, and a box that hits its nine-hour dead-man's switch mid-sweep loses
+every result it has not copied home, so they run as a second, separate session:
+
+```bash
+SWEEP_ENV="SECTIONS='microbench ablations http' INSTALL_VLLM=1" scripts/aws_bench.sh --branch main
+```
+
+- `microbench` times the decode kernel alone (`bench/kernel_bench.py`) and reports
+  effective KV bandwidth. Pass the card's spec-sheet bandwidth with `--peak-gbps` if you
+  want it drawn on the chart; the script does not know it.
+- `ablations` runs `bench/sweep.py` for block size, preemption (recompute vs swap across
+  prompt lengths, under a deliberately starved cache), the kernel arms (gather, CUDA
+  kernel, kernel plus CUDA graphs), and chunked prefill with long prompts mixed in.
+- `http` starts PagedServe's server and then vLLM's on the same port with matched limits,
+  and drives each with the same client. `INSTALL_VLLM=1` builds vLLM into its own
+  virtualenv, because it pins its own torch. Pin it with `VLLM_VERSION=...` if you want
+  the run to be repeatable.
+
 ### Watching it from elsewhere
 
 The sweep takes hours; you do not need to sit with it.

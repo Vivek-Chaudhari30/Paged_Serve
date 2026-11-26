@@ -431,7 +431,7 @@ log "smoke sweep"
 # discovering that it does not.
 remote "cd ${REMOTE_DIR} && . .venv/bin/activate && \
     SECTIONS=baselines CONCURRENCIES='1 8' NUM_REQUESTS=32 REPEATS=1 \
-    RESULT_DIR=smoke SKIP_INSTALL=1 bash scripts/explorer_job.sbatch" ||
+    RESULT_DIR=smoke SKIP_INSTALL=1 SKIP_GATE=1 bash scripts/explorer_job.sbatch" ||
     die "the smoke sweep failed. Fix it before spending an hour on the full one."
 
 log "full sweep (nohup, teed to sweep.log)"
@@ -439,7 +439,7 @@ log "full sweep (nohup, teed to sweep.log)"
 # passed explicitly because profile_num_blocks is optimistic without a profiling
 # forward pass, and an OOM two hours in costs the whole session.
 remote "cd ${REMOTE_DIR} && . .venv/bin/activate && \
-    nohup env ${SWEEP_ENV:-} NUM_BLOCKS=${NUM_BLOCKS} SKIP_INSTALL=1 \
+    nohup env ${SWEEP_ENV:-} NUM_BLOCKS=${NUM_BLOCKS} SKIP_INSTALL=1 SKIP_GATE=1 \
     bash scripts/explorer_job.sbatch > sweep.log 2>&1 &
     echo started"
 

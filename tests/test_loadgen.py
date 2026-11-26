@@ -410,3 +410,74 @@ class TestSharedPrefix:
         prompts = synthetic_prompts(4, max_tokens=4)
         with pytest.raises(ValueError, match="fraction"):
             apply_shared_prefix(prompts, words=8, fraction=bad, rng=random.Random(0))
+
+
+# ---------------------------------------------------------------------------
+# Workload shaping for the preemption and chunked-prefill sweeps
+# ---------------------------------------------------------------------------
+
+
+def test_long_prompts_replace_the_requested_fraction_and_stay_distinct():
+    from bench.loadgen import apply_long_prompts, synthetic_prompts
+
+    base = synthetic_prompts(16, max_tokens=4, words=3)
+    out, n = apply_long_prompts(base, words=50, fraction=0.25, rng=random.Random(0))
+    long = [p for p in out if len(p.prompt.split()) == 50]
+    assert n == len(long) == 4
+    # Distinct openings: a cache-on run must not turn this into a cache test.
+    assert len({p.prompt.split()[1] for p in long}) == 4
+    # Arrival order is part of the workload; untouched prompts keep their slots.
+    assert [p.request_id for p in out] == [p.request_id for p in base]
+
+
+def test_long_prompts_validate_fraction():
+    from bench.loadgen import apply_long_prompts, synthetic_prompts
+
+    with pytest.raises(ValueError):
+        apply_long_prompts(
+            synthetic_prompts(2, max_tokens=1), words=5, fraction=1.5, rng=random.Random(0)
+        )
+
+
+def test_cli_records_prompt_shape_and_sweep(tmp_path):
+    from bench.loadgen import main
+
+    out = tmp_path / "r.json"
+    rc = main(
+        [
+            "--backend",
+            "mock",
+            "--mode",
+            "closed",
+            "--concurrency",
+            "2",
+            "--num-requests",
+            "8",
+            "--max-tokens",
+            "2",
+            "--mock-ttft",
+            "0",
+            "--mock-itl",
+            "0",
+            "--prompt-words",
+            "12",
+            "--long-prompt-words",
+            "40",
+            "--long-prompt-fraction",
+            "0.5",
+            "--sweep",
+            "chunked-prefill",
+            "--arm",
+            "ps-chunked-off",
+            "--output",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    result = json.loads(out.read_text())
+    workload = result["workload"]
+    assert workload["prompt_words"] == 12
+    assert workload["dataset"] == "synthetic-12w"
+    assert workload["long_prompts"]["num_requests_long"] == 4
+    assert workload["sweep"] == "chunked-prefill"
+    assert "model" in result["config"]

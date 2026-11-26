@@ -43,6 +43,18 @@ __all__ = ["PagedServeBackend", "StaticEngineBackend"]
 _DONE = object()
 
 
+def _kv_summary(samples: list[float], method: str) -> dict[str, Any] | None:
+    """Reduce per-step utilization samples to what a result file records."""
+    if not samples:
+        return None
+    return {
+        "mean_utilization": sum(samples) / len(samples),
+        "peak_utilization": max(samples),
+        "samples": len(samples),
+        "method": method,
+    }
+
+
 class PagedServeBackend:
     """An async ``BackendFn`` over ``LLMEngine``."""
 
@@ -62,6 +74,27 @@ class PagedServeBackend:
         self._started = False
         self.steps = 0
         self.batch_sizes: list[int] = []
+        self._kv_samples: list[float] = []
+
+    def kv_stats(self) -> dict[str, Any] | None:
+        """Live KV tokens over the token slots of the blocks held, per step.
+
+        This is the bookkeeping ratio the paged allocator exists to raise, taken
+        from the block manager after each step rather than estimated. With
+        prefix caching on, shared blocks count once and their tokens once per
+        sequence, so the ratio can read high; compare it across cache-off runs.
+        """
+        return _kv_summary(self._kv_samples, "live_tokens / (used_blocks * block_size)")
+
+    def _sample_kv(self) -> None:
+        # O(running sequences) of integer adds after a step that already cost a
+        # full forward pass; it runs on the event loop, not inside step().
+        manager = self.engine.block_manager
+        used = manager.num_used_blocks if manager is not None else 0
+        if used <= 0:
+            return
+        live = sum(s.num_computed_tokens for s in self.engine.scheduler.running)
+        self._kv_samples.append(min(1.0, live / (used * manager.block_size)))
 
     async def __call__(self, request: PromptRequest) -> AsyncIterator[str]:
         if request.prompt_token_ids is None:
@@ -119,6 +152,7 @@ class PagedServeBackend:
 
             self.steps += 1
             self.batch_sizes.append(output.batch_size)
+            self._sample_kv()
             self._deliver(output.scheduled)
             self._close_finished(output.scheduled)
 
@@ -179,6 +213,16 @@ class StaticEngineBackend:
         self._task: asyncio.Task | None = None
         self.steps = 0
         self.batch_sizes: list[int] = []
+        self._kv_samples: list[float] = []
+
+    def kv_stats(self) -> dict[str, Any] | None:
+        """Per-step allocated-versus-live ratio, from the engine's own accounting.
+
+        The contiguous backend's denominator is the whole lockstep reservation
+        and the paged backend's is the blocks held; that difference is the
+        Phase 2 result, not an inconsistency.
+        """
+        return _kv_summary(self._kv_samples, "attention backend memory_stats() per step")
 
     async def __call__(self, request: PromptRequest) -> AsyncIterator[str]:
         if request.prompt_token_ids is None:
@@ -234,7 +278,7 @@ class StaticEngineBackend:
                     loop.call_soon_threadsafe(queue.put_nowait, str(token))
 
         try:
-            await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 self.engine.generate,
                 [list(r.prompt_token_ids) for r in requests],
                 max(r.max_tokens for r in requests),
@@ -249,5 +293,7 @@ class StaticEngineBackend:
             return
         finally:
             self.steps += 1
+        stats = getattr(result, "step_stats", None) or []
+        self._kv_samples.extend(u for u in (st.utilization for st in stats) if u is not None)
         for queue in queues:
             loop.call_soon_threadsafe(queue.put_nowait, _DONE)

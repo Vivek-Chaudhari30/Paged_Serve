@@ -560,3 +560,145 @@ def test_preemption_chart_skipped_without_preemptions(tmp_path: Path) -> None:
     out = tmp_path / "out"
     run(rdir, out)
     assert not (_chart_dir(out) / "preemption_policies.png").exists()
+
+
+# ---------------------------------------------------------------------------
+# Fields as loadgen actually writes them, and the charts for the new sweeps
+# ---------------------------------------------------------------------------
+
+
+def test_parse_result_reads_realised_prefix_fraction_from_loadgen_shape(tmp_path: Path) -> None:
+    """loadgen writes workload.shared_prefix.realised_fraction, never a flat
+    prefix_fraction; a cache-off run has no other way to get an x value."""
+    data = _make_result(arm="ps-continuous")
+    data["workload"]["shared_prefix"] = {"words": 400, "realised_fraction": 0.0}
+    rec = _parse_result(_write(tmp_path, "r.json", data))
+    assert rec is not None and rec.prefix_fraction == 0.0
+
+
+def test_prefix_chart_plots_cache_off_from_loadgen_shape(tmp_path: Path) -> None:
+    from bench.plot import plot_ttft_vs_prefix_fraction
+
+    rdir = tmp_path / "results"
+    rdir.mkdir()
+    for frac in (0.0, 0.5):
+        for cache in (False, True):
+            data = _make_result(
+                arm="ps-continuous", prefix_cache={"hit_rate": frac} if cache else None
+            )
+            data["workload"]["shared_prefix"] = {"words": 400, "realised_fraction": frac}
+            _write(rdir, f"f{frac}_{cache}.json", data)
+    recs = [_parse_result(p) for p in sorted(rdir.glob("*.json"))]
+    off = [r for r in recs if r is not None and not r.prefix_cache_on]
+    assert len(off) == 2 and all(r.prefix_fraction is not None for r in off)
+    assert plot_ttft_vs_prefix_fraction([r for r in recs if r], tmp_path, "hw")
+
+
+def test_model_name_is_read_from_a_nested_engine_config(tmp_path: Path) -> None:
+    data = _make_result(arm="ps-continuous")
+    data["config"]["engine"]["model"] = {"name": _MODEL, "num_layers": 24}
+    rec = _parse_result(_write(tmp_path, "r.json", data))
+    assert rec is not None and rec.model == _MODEL
+
+
+def test_sweeps_that_fix_another_variable_stay_out_of_concurrency_charts(tmp_path: Path) -> None:
+    from bench.plot import _concurrency_records
+
+    rdir = tmp_path / "r"
+    rdir.mkdir()
+    a = _make_result(arm="ps-continuous", concurrency=16)
+    b = _make_result(arm="ps-continuous", concurrency=16)
+    b["workload"]["sweep"] = "block-size"
+    recs = [_parse_result(_write(rdir, "a.json", a)), _parse_result(_write(rdir, "b.json", b))]
+    kept = _concurrency_records([r for r in recs if r], ["ps-continuous"])
+    assert [r.path.name for r in kept] == ["a.json"]
+
+
+def test_preemption_chart_uses_prompt_length_when_present(tmp_path: Path) -> None:
+    rdir = tmp_path / "results"
+    rdir.mkdir()
+    for policy in ("recompute", "swap"):
+        for words in (128, 1024):
+            data = _with_engine(
+                _make_result(arm="ps-continuous", concurrency=16),
+                block_size=16,
+                policy=policy,
+                preemptions=3,
+            )
+            data["workload"]["prompt_words"] = words
+            data["workload"]["sweep"] = "preemption"
+            _write(rdir, f"{policy}{words}.json", data)
+    out = tmp_path / "out"
+    run(rdir, out)
+    assert (_chart_dir(out) / "preemption_policies.png").exists()
+    # And none of them leaked into the arms chart as a concurrency=16 point.
+    assert not (_chart_dir(out) / "throughput_vs_concurrency.png").exists()
+
+
+def test_kernel_and_http_charts_produced(tmp_path: Path) -> None:
+    rdir = tmp_path / "results"
+    rdir.mkdir()
+    for arm in ("ps-gather", "ps-cuda", "ps-cuda-graphs", "ps-http", "vllm-http"):
+        for c in (1, 8):
+            _write(rdir, f"{arm}{c}.json", _make_result(arm=arm, concurrency=c))
+    out = tmp_path / "out"
+    run(rdir, out)
+    d = _chart_dir(out)
+    for name in (
+        "kernel_throughput_vs_concurrency",
+        "kernel_itl_vs_concurrency",
+        "http_throughput_vs_concurrency",
+        "http_ttft_vs_concurrency",
+    ):
+        assert (d / f"{name}.png").exists(), name
+
+
+def test_chunked_prefill_chart_needs_both_sides(tmp_path: Path) -> None:
+    rdir = tmp_path / "results"
+    rdir.mkdir()
+
+    def chunked(on: bool, budget: int, name: str) -> None:
+        data = _make_result(arm="ps-chunked-on" if on else "ps-chunked-off", concurrency=16)
+        data["config"]["engine"]["scheduler"] = {
+            "enable_chunked_prefill": on,
+            "max_num_batched_tokens": budget,
+        }
+        data["workload"]["sweep"] = "chunked-prefill"
+        _write(rdir, name, data)
+
+    chunked(True, 256, "on256.json")
+    out = tmp_path / "out"
+    run(rdir, out)
+    assert not (_chart_dir(out) / "chunked_prefill.png").exists()
+    chunked(False, 8192, "off.json")
+    chunked(True, 512, "on512.json")
+    run(rdir, out)
+    assert (_chart_dir(out) / "chunked_prefill.png").exists()
+
+
+def test_kernel_microbench_chart_and_skip_from_run_records(tmp_path: Path) -> None:
+    rdir = tmp_path / "results"
+    rdir.mkdir()
+    rows = [
+        {
+            "impl": impl,
+            "batch_size": 8,
+            "block_size": 16,
+            "seq_len": L,
+            "us_p50": 10.0 * L,
+            "effective_gbps": 100.0,
+        }
+        for impl in ("cuda", "reference")
+        for L in (128, 1024)
+    ]
+    mb = {
+        "kind": "kernel_microbench",
+        "config": {"peak_gbps": 600.0},
+        "environment": {"gpu": _GPU},
+        "rows": rows,
+    }
+    path = _write(rdir, "mb.json", mb)
+    assert _parse_result(path) is None
+    out = tmp_path / "out"
+    run(rdir, out)
+    assert (out / _hw_safe(_GPU, "kernel", "microbench") / "kernel_microbench_b8_bs16.png").exists()
