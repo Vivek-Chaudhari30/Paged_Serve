@@ -390,7 +390,7 @@ log "cloning ${BRANCH}"
 remote "rm -rf ${REMOTE_DIR} && git clone --branch ${BRANCH} --depth 50 ${REPO_URL} ${REMOTE_DIR}"
 
 log "installing"
-remote "cd ${REMOTE_DIR} && python3 -m venv .venv && . .venv/bin/activate && pip install -q --upgrade pip && pip install -q -e '.[engine,baseline,dev]'"
+remote "cd ${REMOTE_DIR} && python3 -m venv .venv && . .venv/bin/activate && pip install -q --upgrade pip && pip install -q -e '.[engine,server,baseline,dev]'"
 
 log "building the CUDA extension"
 # Explicitly, never through pip: pip builds in an isolated environment with no

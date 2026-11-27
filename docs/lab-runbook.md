@@ -46,7 +46,7 @@ conda create -y -n pagedserve python=3.11 && conda activate pagedserve
 git clone https://github.com/Vivek-Chaudhari30/Paged_Serve.git && cd Paged_Serve
 ```
 ```bash
-pip install -e ".[engine,baseline,dev]"
+pip install -e ".[engine,server,baseline,dev]"
 ```
 ```bash
 export HF_HOME=/path/with/space/hf

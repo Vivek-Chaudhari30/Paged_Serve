@@ -224,12 +224,12 @@ elif [ -n "${ACTIVE_ENV}" ]; then
     if [ "${CONDA_DEFAULT_ENV:-}" = "base" ] && [ -z "${VIRTUAL_ENV:-}" ]; then
         echo "WARNING: installing into conda base; a dedicated env is safer."
     fi
-    python -m pip install -q -e ".[engine,baseline,dev]"
+    python -m pip install -q -e ".[engine,server,baseline,dev]"
 else
     python -m venv .venv-slurm 2>/dev/null || true
     # shellcheck source=/dev/null
     source .venv-slurm/bin/activate 2>/dev/null || true
-    python -m pip install -q -e ".[engine,baseline,dev]"
+    python -m pip install -q -e ".[engine,server,baseline,dev]"
 fi
 run_cmd python -c "import pagedserve; print('pagedserve', pagedserve.__version__)"
 
