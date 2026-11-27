@@ -18,9 +18,31 @@ is, its numbers belong in the README with a link to the raw files, not here.
 
 ## How to turn this into numbers
 
-1. Build the extension on a GPU host and pass `pytest -m gpu` plus the golden gate with
-   `PAGEDSERVE_TEST_DEVICE=cuda`.
-2. Run `python -m bench.sweep arms ...` for PagedServe and the equivalent vLLM benchmark on
-   the same machine, model, dataset and seeds.
-3. Commit the raw JSONs, regenerate charts with `scripts/make_charts.sh`, and only then
+The comparison runs through one client against both servers: `bench/http_backend.py`
+speaks the OpenAI streaming protocol, so the same prompts, seeds, timestamping and result
+format measure PagedServe's server and `vllm serve` alike. A comparison where each side is
+measured by its own harness compares the harnesses.
+
+1. Build the extension on a GPU host and pass the GPU suite
+   (`PAGEDSERVE_TEST_DEVICE=cuda PAGEDSERVE_TEST_DTYPE=float16 pytest`).
+2. Run the `http` section of the sweep script. It starts PagedServe's server, runs
+   `python -m bench.sweep http --http-arm ps-http`, stops it, then does the same for vLLM
+   with `--http-arm vllm-http`:
+
+   ```bash
+   SECTIONS=http INSTALL_VLLM=1 NUM_BLOCKS=8192 bash scripts/explorer_job.sbatch
+   ```
+
+   Both servers get the same dtype, `max_seq_len`, `max_num_seqs`, block size and, with
+   `NUM_BLOCKS`, the same KV capacity (`--num-gpu-blocks-override` on the vLLM side).
+   vLLM's prefix cache is turned off to match PagedServe's default. vLLM lives in its own
+   virtualenv (`.venv-vllm`) because it pins its own torch; installing it alongside the
+   extension would replace the torch the extension was built against. Record the vLLM
+   version it prints into `run_notes.txt`.
+3. Each result file records `workload.http.sse_text_events` (tokens as the client counted
+   them) and, when the server reports it, `usage_completion_tokens`. vLLM sends the usage
+   block; PagedServe's server does not yet, so check that the two servers' event counts
+   per request agree with `max_tokens` before trusting a throughput ratio.
+4. Commit the raw JSONs, regenerate charts with `scripts/make_charts.sh`
+   (`http_throughput_vs_concurrency.png`, `http_ttft_vs_concurrency.png`), and only then
    state a ratio.

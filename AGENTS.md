@@ -162,13 +162,16 @@ This describes the tree as it exists. If you add or remove a file, update it.
 │   ├── loadgen.py          # Poisson + closed-loop load generator
 │   ├── baseline_hf.py      # HuggingFace generate() baselines
 │   ├── pagedserve_backend.py  # PagedServe driver for loadgen
+│   ├── http_backend.py     # stdlib OpenAI-compatible SSE client (PagedServe server, vLLM)
+│   ├── kernel_bench.py     # decode-kernel microbenchmark: us/call, effective GB/s
 │   ├── metrics.py          # TTFT / ITL / E2E percentiles, throughput, goodput
-│   ├── sweep.py            # ablation sweeps: arms, block-size, preemption, prefix
+│   ├── sweep.py            # sweeps: arms, block-size, preemption, prefix, kernel,
+│   │                       #   chunked-prefill, http
 │   └── plot.py             # regenerates every README chart from results/
 │
 ├── tests/                  # one file per module; test_golden.py is the gate,
 │                           # test_attention_cuda.py diffs the kernels against the reference
-├── docs/                   # design.md, how-it-works.md, vllm-gap.md, design-qa.md, aws-runbook.md
+├── docs/                   # design.md, how-it-works.md, vllm-gap.md, design-qa.md, aws-runbook.md, lab-runbook.md
 ├── results/                # committed raw benchmark JSON — the evidence (does not exist yet)
 └── scripts/
     ├── aws_bench.sh        # EC2 launch -> sweep -> teardown
@@ -317,7 +320,12 @@ it is the same box: run the sweep on a GPU. One successful GPU session closes al
    (compiled kernels diffed against the reference ops).
 2. The golden gate on the `cuda` backend:
    `PAGEDSERVE_TEST_DEVICE=cuda PAGEDSERVE_TEST_DTYPE=float16 pytest`.
-3. Only then, `python -m bench.sweep ...` and commit the raw JSON under `results/`.
+3. Only then the sweep, and commit the raw JSON under `results/`. Two sessions, so the
+   dead-man's switch cannot take the whole run with it:
+   - `scripts/aws_bench.sh` with the default sections (baselines, arms, prefix, poisson);
+   - again with `SWEEP_ENV="SECTIONS='microbench ablations http' INSTALL_VLLM=1"` for the
+     kernel microbenchmark, the block-size / preemption / kernel / chunked-prefill sweeps,
+     and the PagedServe-vs-vLLM HTTP comparison.
 
 ### Verified on a Tesla T4 (sm_75, torch 2.10+cu128, float16 and float32)
 

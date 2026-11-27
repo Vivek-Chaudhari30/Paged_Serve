@@ -159,7 +159,8 @@ python bench/loadgen.py --backend pagedserve --model Qwen/Qwen2.5-0.5B-Instruct 
     --mode closed --concurrency 32 --num-requests 256 --max-tokens 128 \
     --output results/<run>.json
 
-# Ablation sweeps: arms | block-size | preemption | prefix  (--dry-run prints the grid)
+# Ablation sweeps: arms | block-size | preemption | prefix | kernel | chunked-prefill | http
+# (--dry-run prints the grid)
 python -m bench.sweep arms --model Qwen/Qwen2.5-0.5B-Instruct \
     --dataset data/sharegpt.json --out results/arms
 
@@ -180,7 +181,8 @@ reported; P50/P95/P99 for every latency metric; Poisson arrivals for headline nu
 every chart regenerated from `results/`, never drawn by hand. Supporting scripts:
 [`scripts/aws_bench.sh`](scripts/aws_bench.sh) (EC2 launch, sweep and teardown; see the
 [runbook](docs/aws-runbook.md)), [`scripts/explorer_job.sbatch`](scripts/explorer_job.sbatch)
-(SLURM, A100) and [`scripts/kaggle_bootstrap.sh`](scripts/kaggle_bootstrap.sh) (notebook GPUs).
+(SLURM, A100, or plain `bash` on a lab GPU box; see the
+[lab runbook](docs/lab-runbook.md)) and [`scripts/kaggle_bootstrap.sh`](scripts/kaggle_bootstrap.sh) (notebook GPUs).
 
 ---
 
@@ -271,7 +273,8 @@ pagedserve/
 ├── worker/              cache_engine.py (KV allocation, swap, profiling), cuda_graph.py
 └── server/              api.py (FastAPI routes, EngineRunner), protocol.py, __main__.py (CLI)
 csrc/                    paged_attention.cu, cache_kernels.cu, trivial.cu (build canary), bindings.cpp
-bench/                   loadgen.py, metrics.py, baseline_hf.py, pagedserve_backend.py, sweep.py, plot.py
+bench/                   loadgen.py, metrics.py, baseline_hf.py, pagedserve_backend.py,
+                         http_backend.py, kernel_bench.py, sweep.py, plot.py
 scripts/                 AWS / SLURM / Kaggle runners, GPU smoke + diagnostics, chart regeneration
 tests/                   unit tests per module + test_golden.py (the commit gate)
 docs/                    design, explainer, vLLM gap analysis, design Q&A, AWS runbook
@@ -295,6 +298,7 @@ management, and those address different bottlenecks.
 | [docs/vllm-gap.md](docs/vllm-gap.md) | A code-level comparison with vLLM and where the gaps should show up |
 | [docs/design-qa.md](docs/design-qa.md) | Short answers to "why paging?", "why block size 16?", "why chunked prefill?" |
 | [docs/aws-runbook.md](docs/aws-runbook.md) | Running the sweep on EC2 from zero, including teardown discipline |
+| [docs/lab-runbook.md](docs/lab-runbook.md) | Running the sweep on a shared SSH GPU machine with no scheduler |
 | [AGENTS.md](AGENTS.md) | Rules for contributors and coding agents: the no-fabricated-numbers rule, the golden gate, hot-loop discipline |
 
 ## References

@@ -39,12 +39,22 @@ ARM_ORDER: list[str] = [
     "ps-continuous",
 ]
 
+# The kernel sweep: each arm adds one thing to the one before it.
+KERNEL_ARMS: list[str] = ["ps-gather", "ps-cuda", "ps-cuda-graphs"]
+# The same client against two servers (bench/http_backend.py).
+HTTP_ARMS: list[str] = ["ps-http", "vllm-http"]
+
 _ARM_COLORS: dict[str, str] = {
     "hf-sequential": "#1f77b4",
     "hf-static": "#ff7f0e",
     "ps-contiguous": "#2ca02c",
     "ps-paged": "#d62728",
     "ps-continuous": "#9467bd",
+    "ps-gather": "#7f7f7f",
+    "ps-cuda": "#e377c2",
+    "ps-cuda-graphs": "#bcbd22",
+    "ps-http": "#9467bd",
+    "vllm-http": "#17becf",
 }
 
 _ARM_LABELS: dict[str, str] = {
@@ -53,7 +63,17 @@ _ARM_LABELS: dict[str, str] = {
     "ps-contiguous": "PS contiguous",
     "ps-paged": "PS paged",
     "ps-continuous": "PS continuous",
+    "ps-gather": "PS gather (Python read path)",
+    "ps-cuda": "PS CUDA kernel",
+    "ps-cuda-graphs": "PS CUDA kernel + graphs",
+    "ps-http": "PagedServe over HTTP",
+    "vllm-http": "vLLM over HTTP",
 }
+
+# Sweeps whose runs hold some other variable fixed at one concurrency (block
+# size, a starved cache, a shared prefix, long prompts). Pooling them into a
+# concurrency chart would average different experiments into one point.
+_NON_CONCURRENCY_SWEEPS = frozenset({"block-size", "preemption", "prefix", "chunked-prefill"})
 
 # Each entry: (summary-key-suffix, legend-label, linestyle).
 _PCTILE_STYLES: list[tuple[str, str, str]] = [
@@ -106,6 +126,13 @@ class RunRecord:
     preemption_policy: str | None = None
     # workload.scheduler.preemptions.
     preemptions: int | None = None
+    # workload.sweep, written by bench/sweep.py; None for runs from elsewhere.
+    sweep: str | None = None
+    # workload.prompt_words: fixed synthetic prompt length, when the run had one.
+    prompt_words: int | None = None
+    # config.engine.scheduler: whether prompts were chunked, and the step budget.
+    chunked_prefill: bool | None = None
+    max_num_batched_tokens: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -180,10 +207,14 @@ def _parse_result(path: Path) -> RunRecord | None:
         )
         return None
 
+    if raw.get("kind") == "kernel_microbench":
+        # Not a load-generator run; plot_kernel_microbench reads these.
+        return None
+
     config = raw.get("config") or {}
     engine_cfg = config.get("engine") or {}
     backend_cfg = config.get("backend_config") or {}
-    model: str | None = engine_cfg.get("model") or backend_cfg.get("model") or config.get("model")
+    model = _model_name(config, engine_cfg, backend_cfg)
     if not model:
         logger.warning("skipping %s: model name not found in config", path)
         return None
@@ -201,6 +232,14 @@ def _parse_result(path: Path) -> RunRecord | None:
     summary = raw.get("summary") or {}
     pc = workload.get("prefix_cache") or {}
     kv_stats = workload.get("kv_stats") or {}
+    sched_cfg = engine_cfg.get("scheduler") or {}
+
+    # loadgen records the *realised* shared fraction under workload.shared_prefix
+    # (how many requests actually carried it). A flat prefix_fraction is
+    # accepted too, for files written by other tools.
+    prefix_fraction = workload.get("prefix_fraction")
+    if prefix_fraction is None:
+        prefix_fraction = (workload.get("shared_prefix") or {}).get("realised_fraction")
 
     kv_util: float | None = (
         summary.get("kv_utilization")
@@ -216,7 +255,7 @@ def _parse_result(path: Path) -> RunRecord | None:
         dataset=str(workload.get("dataset") or "unknown"),
         concurrency=workload.get("concurrency"),
         max_tokens=workload.get("max_tokens"),
-        prefix_fraction=workload.get("prefix_fraction"),
+        prefix_fraction=prefix_fraction,
         prefix_cache_on=bool(pc),
         prefix_hit_rate=pc.get("hit_rate"),
         output_throughput=summary.get("output_throughput"),
@@ -228,9 +267,30 @@ def _parse_result(path: Path) -> RunRecord | None:
         itl_p99=summary.get("itl_p99"),
         kv_utilization=kv_util,
         block_size=(engine_cfg.get("cache") or {}).get("block_size"),
-        preemption_policy=(engine_cfg.get("scheduler") or {}).get("preemption_policy"),
+        preemption_policy=sched_cfg.get("preemption_policy"),
         preemptions=(workload.get("scheduler") or {}).get("preemptions"),
+        sweep=workload.get("sweep"),
+        prompt_words=workload.get("prompt_words"),
+        chunked_prefill=sched_cfg.get("enable_chunked_prefill"),
+        max_num_batched_tokens=sched_cfg.get("max_num_batched_tokens"),
     )
+
+
+def _model_name(
+    config: dict[str, Any], engine_cfg: dict[str, Any], backend_cfg: dict[str, Any]
+) -> str | None:
+    """The model a run measured, from wherever its writer put it.
+
+    The engine dump nests a whole ModelConfig under ``model``; its ``name`` is
+    the label. Charts are grouped by this string, so a dict rendered with
+    ``str()`` would both read badly and split one model into two groups.
+    """
+    for candidate in (config.get("model"), engine_cfg.get("model"), backend_cfg.get("model")):
+        if isinstance(candidate, dict):
+            candidate = candidate.get("name")
+        if candidate:
+            return str(candidate)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -278,16 +338,27 @@ def _median_band(
 # ---------------------------------------------------------------------------
 
 
+def _concurrency_records(records: list[RunRecord], arms: list[str]) -> list[RunRecord]:
+    return [
+        r
+        for r in records
+        if r.concurrency is not None and r.arm in arms and r.sweep not in _NON_CONCURRENCY_SWEEPS
+    ]
+
+
 def plot_throughput_vs_concurrency(
     records: list[RunRecord],
     out_dir: Path,
     hw_label: str,
+    *,
+    arms: list[str] = ARM_ORDER,
+    name: str = "throughput_vs_concurrency",
+    title: str = "Output-token throughput vs concurrency",
 ) -> bool:
-    usable = [r for r in records if r.concurrency is not None and r.output_throughput is not None]
+    usable = [r for r in _concurrency_records(records, arms) if r.output_throughput is not None]
     if not usable:
         print(
-            f"[throughput-vs-concurrency] skipping '{hw_label}': "
-            "need workload.concurrency + summary.output_throughput"
+            f"[{name}] skipping '{hw_label}': need workload.concurrency + summary.output_throughput"
         )
         return False
 
@@ -298,7 +369,7 @@ def plot_throughput_vs_concurrency(
         )
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    for arm in ARM_ORDER:
+    for arm in arms:
         ys_by_x = by_arm.get(arm)
         if not ys_by_x:
             continue
@@ -310,14 +381,14 @@ def plot_throughput_vs_concurrency(
 
     ax.set_xlabel("Concurrency (in-flight requests)")
     ax.set_ylabel("Output throughput (tokens / s)")
-    ax.set_title(f"Output-token throughput vs concurrency\n{hw_label}")
+    ax.set_title(f"{title}\n{hw_label}")
     ax.legend()
     ax.grid(visible=True, linestyle="--", alpha=0.4)
     fig.tight_layout()
-    dest = out_dir / "throughput_vs_concurrency.png"
+    dest = out_dir / f"{name}.png"
     fig.savefig(dest, dpi=150)
     plt.close(fig)
-    print(f"[throughput-vs-concurrency] wrote {dest}")
+    print(f"[{name}] wrote {dest}")
     return True
 
 
@@ -334,14 +405,14 @@ def _latency_vs_concurrency(
     title: str,
     out_path: Path,
     hw_label: str,
+    arms: list[str] = ARM_ORDER,
 ) -> bool:
     """Shared implementation for TTFT and ITL percentile charts."""
     attr_map = {pct_key: f"{prefix}_{pct_key}" for pct_key, _, _ in _PCTILE_STYLES}
     usable = [
         r
-        for r in records
-        if r.concurrency is not None
-        and any(getattr(r, attr_map[pct_key]) is not None for pct_key, _, _ in _PCTILE_STYLES)
+        for r in _concurrency_records(records, arms)
+        if any(getattr(r, attr_map[pct_key]) is not None for pct_key, _, _ in _PCTILE_STYLES)
     ]
     if not usable:
         print(
@@ -360,7 +431,7 @@ def _latency_vs_concurrency(
                 arm_d.setdefault(pct_key, {}).setdefault(float(r.concurrency), []).append(v)
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    for arm in ARM_ORDER:
+    for arm in arms:
         arm_d = by_arm.get(arm)
         if not arm_d:
             continue
@@ -504,7 +575,11 @@ def plot_kv_utilization(
     out_dir: Path,
     hw_label: str,
 ) -> bool:
-    kv_recs = [r for r in records if r.kv_utilization is not None]
+    kv_recs = [
+        r
+        for r in records
+        if r.kv_utilization is not None and r.sweep not in _NON_CONCURRENCY_SWEEPS
+    ]
     if not kv_recs:
         print(
             f"[kv-utilization] skipping '{hw_label}': "
@@ -630,7 +705,12 @@ def plot_preemption_policies(
     out_dir: Path,
     hw_label: str,
 ) -> bool:
-    """Throughput vs concurrency, one line per preemption policy.
+    """Throughput against prompt length, one line per preemption policy.
+
+    Prompt length is the axis because it is the variable the two costs scale
+    with differently: recompute redoes the prefill, swap copies the KV across
+    PCIe twice. Files without a fixed prompt length (older sweeps) fall back to
+    concurrency on the x axis.
 
     Only runs that actually preempted are informative; the chart needs both
     policies present with a nonzero preemption count somewhere.
@@ -639,10 +719,13 @@ def plot_preemption_policies(
         r
         for r in records
         if r.preemption_policy is not None
-        and r.concurrency is not None
         and r.output_throughput is not None
         and r.arm == "ps-continuous"
+        and (r.prompt_words is not None or r.concurrency is not None)
     ]
+    by_prompt = any(r.prompt_words is not None for r in usable)
+    if by_prompt:
+        usable = [r for r in usable if r.prompt_words is not None]
     policies = {r.preemption_policy for r in usable}
     if not {"recompute", "swap"} <= policies or not any((r.preemptions or 0) > 0 for r in usable):
         print(
@@ -656,12 +739,17 @@ def plot_preemption_policies(
         data: dict[float, list[float]] = {}
         for r in usable:
             if r.preemption_policy == policy:
-                data.setdefault(float(r.concurrency), []).append(r.output_throughput)
+                x = r.prompt_words if by_prompt else r.concurrency
+                data.setdefault(float(x), []).append(r.output_throughput)  # type: ignore[arg-type]
         xs, meds, lo, hi = _median_band(data)
         ax.plot(xs, meds, marker="o", color=color, label=policy)
         if len(xs) > 1:
             ax.fill_between(xs, lo, hi, color=color, alpha=0.15)
-    ax.set_xlabel("Concurrency (in-flight requests)")
+    if by_prompt:
+        ax.set_xscale("log", base=2)
+        ax.set_xlabel("Prompt length (words; synthetic, about one token each)")
+    else:
+        ax.set_xlabel("Concurrency (in-flight requests)")
     ax.set_ylabel("Output throughput (tokens / s)")
     ax.set_title(f"Preemption policy: recompute vs swap\n{hw_label}")
     ax.legend()
@@ -672,6 +760,181 @@ def plot_preemption_policies(
     plt.close(fig)
     print(f"[preemption] wrote {dest}")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Charts 8 & 9 — kernel arms and the HTTP comparison, vs concurrency
+# ---------------------------------------------------------------------------
+
+
+def plot_kernel_arms(records: list[RunRecord], out_dir: Path, hw_label: str) -> bool:
+    """Throughput and ITL for gather -> CUDA kernel -> kernel + graphs."""
+    wrote = plot_throughput_vs_concurrency(
+        records,
+        out_dir,
+        hw_label,
+        arms=KERNEL_ARMS,
+        name="kernel_throughput_vs_concurrency",
+        title="Attention read path: throughput vs concurrency",
+    )
+    if wrote:
+        _latency_vs_concurrency(
+            records,
+            prefix="itl",
+            y_label="ITL (s)",
+            title="Attention read path: ITL P50 / P95 / P99 vs concurrency",
+            out_path=out_dir / "kernel_itl_vs_concurrency.png",
+            hw_label=hw_label,
+            arms=KERNEL_ARMS,
+        )
+    return wrote
+
+
+def plot_http_comparison(records: list[RunRecord], out_dir: Path, hw_label: str) -> bool:
+    """PagedServe and vLLM through the same HTTP client, same workload."""
+    wrote = plot_throughput_vs_concurrency(
+        records,
+        out_dir,
+        hw_label,
+        arms=HTTP_ARMS,
+        name="http_throughput_vs_concurrency",
+        title="Over HTTP: PagedServe vs vLLM, throughput vs concurrency",
+    )
+    if wrote:
+        _latency_vs_concurrency(
+            records,
+            prefix="ttft",
+            y_label="TTFT (s)",
+            title="Over HTTP: PagedServe vs vLLM, TTFT P50 / P95 / P99",
+            out_path=out_dir / "http_ttft_vs_concurrency.png",
+            hw_label=hw_label,
+            arms=HTTP_ARMS,
+        )
+    return wrote
+
+
+# ---------------------------------------------------------------------------
+# Chart 10 — chunked prefill: the ITL tail it buys, the TTFT it costs
+# ---------------------------------------------------------------------------
+
+
+def plot_chunked_prefill(records: list[RunRecord], out_dir: Path, hw_label: str) -> bool:
+    """ITL P99 and TTFT P99, chunking off and at each token budget.
+
+    Both panels, because the tradeoff is the result: chunking caps per-step
+    work, which bounds the ITL tail, and pays for it with prefill spread over
+    more steps. Showing only the ITL side would report the benefit without the
+    cost.
+    """
+    usable = [r for r in records if r.sweep == "chunked-prefill" and r.chunked_prefill is not None]
+    on = [r for r in usable if r.chunked_prefill and r.max_num_batched_tokens is not None]
+    off = [r for r in usable if not r.chunked_prefill]
+    if not on or not off:
+        print(f"[chunked-prefill] skipping '{hw_label}': need chunking-off and chunking-on runs")
+        return False
+
+    budgets = sorted({int(r.max_num_batched_tokens) for r in on})  # type: ignore[arg-type]
+    labels = ["off", *[str(b) for b in budgets]]
+    groups = [off, *[[r for r in on if r.max_num_batched_tokens == b] for b in budgets]]
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    for ax, attr, ylabel in (
+        (axes[0], "itl_p99", "ITL P99 (s)"),
+        (axes[1], "ttft_p99", "TTFT P99 (s)"),
+    ):
+        meds, los, his = [], [], []
+        for grp in groups:
+            vals = np.asarray([getattr(r, attr) for r in grp if getattr(r, attr) is not None])
+            if vals.size == 0:
+                meds.append(np.nan)
+                los.append(0.0)
+                his.append(0.0)
+                continue
+            med = float(np.median(vals))
+            meds.append(med)
+            los.append(med - float(vals.min()))
+            his.append(float(vals.max()) - med)
+        xs = np.arange(len(labels))
+        colors = ["#d62728", *["#2ca02c"] * len(budgets)]
+        ax.bar(xs, meds, color=colors, yerr=[los, his], capsize=4)
+        ax.set_xticks(xs, labels)
+        ax.set_xlabel("Chunked prefill: per-step token budget")
+        ax.set_ylabel(ylabel)
+        ax.grid(visible=True, axis="y", linestyle="--", alpha=0.4)
+    fig.suptitle(f"Chunked prefill, long prompts mixed in (median, min-max bars)\n{hw_label}")
+    fig.tight_layout()
+    dest = out_dir / "chunked_prefill.png"
+    fig.savefig(dest, dpi=150)
+    plt.close(fig)
+    print(f"[chunked-prefill] wrote {dest}")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Chart 11 — decode-kernel microbenchmark (bench/kernel_bench.py)
+# ---------------------------------------------------------------------------
+
+
+def _load_microbench(results_dir: Path) -> list[dict[str, Any]]:
+    out = []
+    for path in sorted(results_dir.rglob("*.json")):
+        try:
+            raw = json.loads(path.read_text())
+        except Exception:  # noqa: BLE001 - _load_records already warned about it
+            continue
+        if raw.get("kind") != "kernel_microbench":
+            continue
+        if not (raw.get("environment") or {}).get("gpu"):
+            logger.warning("skipping %s: environment.gpu is absent", path)
+            continue
+        out.append(raw)
+    return out
+
+
+def plot_kernel_microbench(results_dir: Path, out_dir: Path) -> bool:
+    """Microseconds per decode call and achieved bandwidth, against sequence length.
+
+    One figure per (GPU, batch size, block size), one line per implementation.
+    Every file must name its GPU, the same rule as every other chart.
+    """
+    files = _load_microbench(results_dir)
+    if not files:
+        print("[kernel-microbench] skipping: no kernel_microbench result files")
+        return False
+    wrote = False
+    for raw in files:
+        gpu = raw["environment"]["gpu"]
+        rows = raw.get("rows") or []
+        keys = sorted({(r["batch_size"], r["block_size"]) for r in rows})
+        for batch, block in keys:
+            sel = [r for r in rows if r["batch_size"] == batch and r["block_size"] == block]
+            impls = sorted({r["impl"] for r in sel})
+            fig, (ax_t, ax_b) = plt.subplots(1, 2, figsize=(11, 4.5))
+            for impl in impls:
+                pts = sorted((r["seq_len"], r) for r in sel if r["impl"] == impl)
+                xs = [x for x, _ in pts]
+                ax_t.plot(xs, [r["us_p50"] for _, r in pts], marker="o", label=impl)
+                ax_b.plot(xs, [r["effective_gbps"] for _, r in pts], marker="o", label=impl)
+            peak = raw.get("config", {}).get("peak_gbps")
+            if peak:
+                ax_b.axhline(peak, color="black", linestyle="--", label="stated peak")
+            for ax in (ax_t, ax_b):
+                ax.set_xscale("log", base=2)
+                ax.set_xlabel("Context length (tokens)")
+                ax.grid(visible=True, linestyle="--", alpha=0.4)
+                ax.legend(fontsize=8)
+            ax_t.set_ylabel("µs per decode call (P50)")
+            ax_b.set_ylabel("Effective KV read bandwidth (GB/s)")
+            fig.suptitle(f"Decode attention microbenchmark\n{gpu} · batch {batch} · block {block}")
+            fig.tight_layout()
+            sub = out_dir / _hw_safe(gpu, "kernel", "microbench")
+            sub.mkdir(parents=True, exist_ok=True)
+            dest = sub / f"kernel_microbench_b{batch}_bs{block}.png"
+            fig.savefig(dest, dpi=150)
+            plt.close(fig)
+            print(f"[kernel-microbench] wrote {dest}")
+            wrote = True
+    return wrote
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +965,8 @@ def run(results_dir: Path, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     records = _load_records(results_dir)
     if not records:
-        print(f"No usable result files in {results_dir} — nothing to plot.")
+        print(f"No usable load-generator result files in {results_dir} — nothing to plot.")
+        plot_kernel_microbench(results_dir, out_dir)
         return
 
     groups: dict[tuple[str, str, str], list[RunRecord]] = defaultdict(list)
@@ -721,6 +985,11 @@ def run(results_dir: Path, out_dir: Path) -> None:
         plot_kv_utilization(grp, grp_out, hw_label)
         plot_vs_block_size(grp, grp_out, hw_label)
         plot_preemption_policies(grp, grp_out, hw_label)
+        plot_kernel_arms(grp, grp_out, hw_label)
+        plot_http_comparison(grp, grp_out, hw_label)
+        plot_chunked_prefill(grp, grp_out, hw_label)
+
+    plot_kernel_microbench(results_dir, out_dir)
 
 
 def main(argv: list[str] | None = None) -> int:
