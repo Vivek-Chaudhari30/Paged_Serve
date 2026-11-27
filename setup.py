@@ -63,13 +63,18 @@ def build_config() -> tuple[list, dict]:
             "csrc/paged_attention.cu",
             "csrc/cache_kernels.cu",
         ],
+        # No -std flag either: BuildExtension adds the standard the installed
+        # torch's headers need, and only when none is given. Torch 2.x up to
+        # some release wanted C++17; newer releases refuse to compile below
+        # C++20 ("C++20 or later compatible compiler is required"). Pinning one
+        # here breaks the build on whichever side of that line it is not.
         extra_compile_args={
-            "cxx": ["-O3", "-std=c++17"],
+            "cxx": ["-O3"],
             # No -arch flag: torch infers the architectures of the visible GPUs,
             # and hardcoding one produces a binary that fails at load time on
             # every other card. TORCH_CUDA_ARCH_LIST overrides when
             # cross-compiling for a machine that is not this one.
-            "nvcc": ["-O3", "-std=c++17", "--expt-relaxed-constexpr"],
+            "nvcc": ["-O3", "--expt-relaxed-constexpr"],
         },
     )
     return [extension], {"build_ext": BuildExtension}
