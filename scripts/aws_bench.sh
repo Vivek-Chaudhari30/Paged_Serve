@@ -424,7 +424,7 @@ remote "cd ${REMOTE_DIR} && . .venv/bin/activate && PAGEDSERVE_TEST_DEVICE=cuda 
     die "the golden gate failed on CUDA. This is a bug report, not an obstacle."
 
 log "fetching the dataset"
-remote "cd ${REMOTE_DIR} && scripts/fetch_dataset.sh"
+remote "cd ${REMOTE_DIR} && bash scripts/fetch_dataset.sh"
 
 log "smoke sweep"
 # Tiny, first, to prove the pipeline writes valid JSON before an hour is spent

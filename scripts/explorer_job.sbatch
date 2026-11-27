@@ -259,7 +259,7 @@ fi
 echo "==> dataset"
 DATASET="${DATASET:-}"
 if [ -z "${DATASET}" ]; then
-    run_cmd scripts/fetch_dataset.sh
+    run_cmd bash scripts/fetch_dataset.sh
     DATASET="${DATA_DIR:-data}/sharegpt_v3.json"
 fi
 echo "using dataset: ${DATASET}"
